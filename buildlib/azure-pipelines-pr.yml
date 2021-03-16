@@ -100,7 +100,7 @@ stages:
               fi
             displayName: cstools reports
 
-      # Perform test builds on relevant distributions.
+      # Perform test builds on relevant distributions
       - job: Distros
         displayName: Build for
         strategy:
