@@ -100,12 +100,12 @@ if [ $opt_binrpm -eq 1 ]; then
 	with_args+=" $(with_arg cuda)"
 	with_args+=" $(with_arg gdrcopy)"
 	with_args+=" $(with_arg ib)"
-	with_args+=" $(with_arg cm ib_cm)"
 	with_args+=" $(with_arg knem)"
 	with_args+=" $(with_arg rdmacm)"
 	with_args+=" $(with_arg rocm)"
 	with_args+=" $(with_arg ugni)"
 	with_args+=" $(with_arg xpmem)"
+	with_args+=" $(with_arg vfs)"
 	with_args+=" $(with_arg java)"
 
 	echo rpmbuild -bb $rpmmacros $rpmopts $rpmspec $defines $with_args | bash -eEx

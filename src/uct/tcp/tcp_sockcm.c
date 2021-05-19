@@ -15,7 +15,7 @@
 
 
 ucs_config_field_t uct_tcp_sockcm_config_table[] = {
-  {"TCP_CM_", "", NULL,
+  {"CM_", "", NULL,
    ucs_offsetof(uct_tcp_sockcm_config_t, super), UCS_CONFIG_TYPE_TABLE(uct_cm_config_table)},
 
   {"PRIV_DATA_LEN", "2048",
@@ -25,10 +25,6 @@ ucs_config_field_t uct_tcp_sockcm_config_table[] = {
    UCT_TCP_SEND_RECV_BUF_FIELDS(ucs_offsetof(uct_tcp_sockcm_config_t, sockopt)),
 
    UCT_TCP_SYN_CNT(ucs_offsetof(uct_tcp_sockcm_config_t, syn_cnt)),
-
-   {"ALLOW_ADDR_INUSE", "n",
-    "Allow using an address that is already in use by another socket.",
-    ucs_offsetof(uct_tcp_sockcm_config_t, allow_addr_inuse), UCS_CONFIG_TYPE_BOOL},
 
   {NULL}
 };
@@ -98,9 +94,9 @@ void uct_tcp_sa_data_handler(int fd, ucs_event_set_types_t events, void *arg)
 
     ucs_assertv(ep->fd == fd, "ep->fd %d fd %d, ep_state %d", ep->fd, fd, ep->state);
 
-    ucs_trace("ep %p on %s received event (state = %d)", ep,
+    ucs_trace("ep %p on %s received event 0x%x (state = %d)", ep,
               (ep->state & UCT_TCP_SOCKCM_EP_ON_SERVER) ? "server" : "client",
-              ep->state);
+              events, ep->state);
 
     if (events & UCS_EVENT_SET_EVERR) {
         status = uct_tcp_sockcm_event_err_to_ucs_err_log(fd, &log_level);
@@ -134,6 +130,7 @@ void uct_tcp_sa_data_handler(int fd, ucs_event_set_types_t events, void *arg)
 
 static uct_iface_ops_t uct_tcp_sockcm_iface_ops = {
     .ep_pending_purge         = (uct_ep_pending_purge_func_t)ucs_empty_function,
+    .ep_connect               = uct_tcp_sockcm_ep_connect,
     .ep_disconnect            = uct_tcp_sockcm_ep_disconnect,
     .cm_ep_conn_notify        = uct_tcp_sockcm_cm_ep_conn_notify,
     .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_tcp_sockcm_ep_t),
@@ -141,6 +138,7 @@ static uct_iface_ops_t uct_tcp_sockcm_iface_ops = {
     .ep_put_bcopy             = (uct_ep_put_bcopy_func_t)ucs_empty_function_return_unsupported,
     .ep_get_bcopy             = (uct_ep_get_bcopy_func_t)ucs_empty_function_return_unsupported,
     .ep_am_short              = (uct_ep_am_short_func_t)ucs_empty_function_return_unsupported,
+    .ep_am_short_iov          = (uct_ep_am_short_iov_func_t)ucs_empty_function_return_unsupported,
     .ep_am_bcopy              = (uct_ep_am_bcopy_func_t)ucs_empty_function_return_unsupported,
     .ep_atomic_cswap64        = (uct_ep_atomic_cswap64_func_t)ucs_empty_function_return_unsupported,
     .ep_atomic64_post         = (uct_ep_atomic64_post_func_t)ucs_empty_function_return_unsupported,
@@ -177,12 +175,11 @@ UCS_CLASS_INIT_FUNC(uct_tcp_sockcm_t, uct_component_h component,
                               &uct_tcp_sockcm_iface_ops, worker, component,
                               config);
 
-    self->priv_data_len    = cm_config->priv_data_len -
-                             sizeof(uct_tcp_sockcm_priv_data_hdr_t);
-    self->sockopt_sndbuf   = cm_config->sockopt.sndbuf;
-    self->sockopt_rcvbuf   = cm_config->sockopt.rcvbuf;
-    self->syn_cnt          = cm_config->syn_cnt;
-    self->allow_addr_inuse = cm_config->allow_addr_inuse;
+    self->priv_data_len  = cm_config->priv_data_len +
+                                   sizeof(uct_tcp_sockcm_priv_data_hdr_t);
+    self->sockopt_sndbuf = cm_config->sockopt.sndbuf;
+    self->sockopt_rcvbuf = cm_config->sockopt.rcvbuf;
+    self->syn_cnt        = cm_config->syn_cnt;
 
     ucs_list_head_init(&self->ep_list);
 

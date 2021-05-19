@@ -23,9 +23,9 @@
 #define UCT_RC_QP_TABLE_MEMB_ORDER  (UCT_IB_QPN_ORDER - UCT_RC_QP_TABLE_ORDER)
 #define UCT_RC_QP_MAX_RETRY_COUNT   7
 
-#define UCT_RC_CHECK_AM_SHORT(_am_id, _length, _max_inline) \
+#define UCT_RC_CHECK_AM_SHORT(_am_id, _length, _header_t, _max_inline) \
      UCT_CHECK_AM_ID(_am_id); \
-     UCT_CHECK_LENGTH(sizeof(uct_rc_am_short_hdr_t) + _length, 0, _max_inline, "am_short");
+     UCT_CHECK_LENGTH(sizeof(_header_t) + _length, 0, _max_inline, "am_short");
 
 #define UCT_RC_CHECK_ZCOPY_DATA(_header_length, _length, _seg_size) \
     UCT_CHECK_LENGTH(_header_length + _length, 0, _seg_size, "am_zcopy payload"); \
@@ -157,6 +157,7 @@ typedef struct uct_rc_iface_common_config {
         unsigned             rnr_retry_count;
         size_t               max_get_zcopy;
         size_t               max_get_bytes;
+        int                  poll_always;
     } tx;
 
     struct {
@@ -188,7 +189,8 @@ typedef struct uct_rc_iface_ops {
                                        uct_rc_hdr_t *hdr, unsigned length,
                                        uint32_t imm_data, uint16_t lid,
                                        unsigned flags);
-    void                 (*cleanup_qp)(uct_ib_async_event_wait_t *cleanup_ctx);
+    unsigned             (*cleanup_qp)(void *arg);
+    void                 (*ep_post_check)(uct_ep_h tl_ep);
 } uct_rc_iface_ops_t;
 
 
@@ -234,6 +236,7 @@ struct uct_rc_iface {
         unsigned             tx_min_inline;
         unsigned             tx_ops_count;
         uint16_t             tx_moderation;
+        uint8_t              tx_poll_always;
 
         /* Threshold to send "soft" FC credit request. The peer will try to
          * piggy-back credits grant to the counter AM, if any. */
@@ -275,9 +278,10 @@ struct uct_rc_iface {
     /* Progress function (either regular or TM aware) */
     ucs_callback_t           progress;
 };
-UCS_CLASS_DECLARE(uct_rc_iface_t, uct_rc_iface_ops_t*, uct_md_h, uct_worker_h,
-                  const uct_iface_params_t*, const uct_rc_iface_common_config_t*,
-                  uct_ib_iface_init_attr_t*);
+UCS_CLASS_DECLARE(uct_rc_iface_t, uct_rc_iface_ops_t*, uct_iface_ops_t*,
+                  uct_md_h, uct_worker_h, const uct_iface_params_t*,
+                  const uct_rc_iface_common_config_t*,
+                  const uct_ib_iface_init_attr_t*);
 
 
 struct uct_rc_iface_send_op {
@@ -294,6 +298,7 @@ struct uct_rc_iface_send_op {
         void                      *unpack_arg; /* get_bcopy / desc */
         uct_rc_iface_t            *iface;      /* should not be used with
                                                   get_bcopy completions */
+        uct_ep_h                  ep;          /* ep on which we sent ep_check */
     };
     uct_completion_t              *user_comp;
 #ifndef NVALGRIND
@@ -379,6 +384,8 @@ ucs_status_t uct_rc_iface_init_rx(uct_rc_iface_t *iface,
                                   struct ibv_srq **p_srq);
 
 ucs_status_t uct_rc_iface_fence(uct_iface_h tl_iface, unsigned flags);
+
+void uct_rc_iface_vfs_populate(uct_rc_iface_t *iface);
 
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_rc_fc_ctrl(uct_ep_t *ep, unsigned op, uct_rc_pending_req_t *req)
@@ -527,6 +534,12 @@ uct_rc_iface_invoke_pending_cb(uct_rc_iface_t *iface, uct_pending_req_t *req)
                    ucs_status_string(status));
 
     return status;
+}
+
+static UCS_F_ALWAYS_INLINE int
+uct_rc_iface_poll_tx(uct_rc_iface_t *iface, unsigned count)
+{
+    return (count == 0) || iface->config.tx_poll_always;
 }
 
 #endif

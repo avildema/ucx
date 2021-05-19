@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -147,6 +147,14 @@ static void uct_ud_iface_send_skb_init(uct_iface_h tl_iface, void *obj,
     skb->flags = UCT_UD_SEND_SKB_FLAG_INVALID;
 }
 
+static void uct_ud_iface_destroy_qp(uct_ud_iface_t *ud_iface)
+{
+    uct_ud_iface_ops_t *ops = ucs_derived_of(ud_iface->super.ops,
+                                             uct_ud_iface_ops_t);
+
+    ops->destroy_qp(ud_iface);
+}
+
 static ucs_status_t
 uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config)
 {
@@ -160,7 +168,7 @@ uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config
     qp_init_attr.sq_sig_all          = 0;
     qp_init_attr.cap.max_send_wr     = config->super.tx.queue_len;
     qp_init_attr.cap.max_recv_wr     = config->super.rx.queue_len;
-    qp_init_attr.cap.max_send_sge    = 2;
+    qp_init_attr.cap.max_send_sge    = config->super.tx.min_sge + 1;
     qp_init_attr.cap.max_recv_sge    = 1;
     qp_init_attr.cap.max_inline_data = config->super.tx.min_inline;
 
@@ -202,8 +210,9 @@ uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config
     }
 
     return UCS_OK;
+
 err_destroy_qp:
-    uct_ib_destroy_qp(self->qp);
+    uct_ud_iface_destroy_qp(self);
     return UCS_ERR_INVALID_PARAM;
 }
 
@@ -404,8 +413,9 @@ err:
     return status;
 }
 
-UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
-                    uct_worker_h worker, const uct_iface_params_t *params,
+UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops,
+                    uct_iface_ops_t *tl_ops, uct_md_h md, uct_worker_h worker,
+                    const uct_iface_params_t *params,
                     const uct_ud_iface_config_t *config,
                     uct_ib_iface_init_attr_t *init_attr)
 {
@@ -443,7 +453,7 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
     init_attr->seg_size    = ucs_min(mtu, config->super.seg_size);
     init_attr->qp_type     = IBV_QPT_UD;
 
-    UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &ops->super, md, worker,
+    UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &ops->super, tl_ops, md, worker,
                               params, &config->super, init_attr);
 
     if (self->super.super.worker->async == NULL) {
@@ -460,6 +470,7 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
     self->rx.quota               = 0;
     self->config.tx_qp_len       = config->super.tx.queue_len;
     self->config.peer_timeout    = ucs_time_from_sec(config->peer_timeout);
+    self->config.min_poke_time   = ucs_time_from_sec(config->min_poke_time);
     self->config.check_grh_dgid  = config->dgid_check &&
                                    uct_ib_iface_is_roce(&self->super);
 
@@ -508,14 +519,14 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
 
     UCT_UD_IFACE_HOOK_INIT(self);
 
-    status = uct_ud_iface_create_qp(self, config);
-    if (status != UCS_OK) {
-        return UCS_ERR_INVALID_PARAM;
-    }
-
     ucs_ptr_array_init(&self->eps, "ud_eps");
 
-    status = uct_ib_iface_recv_mpool_init(&self->super, &config->super,
+    status = uct_ud_iface_create_qp(self, config);
+    if (status != UCS_OK) {
+        goto err_eps_array;
+    }
+
+    status = uct_ib_iface_recv_mpool_init(&self->super, &config->super, params,
                                           "ud_recv_skb", &self->rx.mp);
     if (status != UCS_OK) {
         goto err_qp;
@@ -570,7 +581,8 @@ err_tx_mpool:
 err_rx_mpool:
     ucs_mpool_cleanup(&self->rx.mp, 1);
 err_qp:
-    uct_ib_destroy_qp(self->qp);
+    uct_ud_iface_destroy_qp(self);
+err_eps_array:
     ucs_ptr_array_cleanup(&self->eps);
     return status;
 }
@@ -591,6 +603,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ud_iface_t)
 {
     ucs_trace_func("");
 
+    uct_ud_iface_remove_async_handlers(self);
+
     /* TODO: proper flush and connection termination */
     uct_ud_enter(self);
     ucs_conn_match_cleanup(&self->conn_match_ctx);
@@ -602,7 +616,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ud_iface_t)
     /* TODO: qp to error state and cleanup all wqes */
     uct_ud_iface_free_pending_rx(self);
     ucs_mpool_cleanup(&self->rx.mp, 0);
-    uct_ib_destroy_qp(self->qp);
+    uct_ud_iface_destroy_qp(self);
     ucs_debug("iface(%p): ptr_array cleanup", self);
     ucs_ptr_array_cleanup(&self->eps);
     ucs_arbiter_cleanup(&self->tx.pending_q);
@@ -623,15 +637,26 @@ ucs_config_field_t uct_ud_iface_config_table[] = {
 
     {"TIMEOUT", "5.0m", "Transport timeout",
      ucs_offsetof(uct_ud_iface_config_t, peer_timeout), UCS_CONFIG_TYPE_TIME},
+
     {"TIMER_TICK", "10ms", "Initial timeout for retransmissions",
      ucs_offsetof(uct_ud_iface_config_t, timer_tick), UCS_CONFIG_TYPE_TIME},
+
     {"TIMER_BACKOFF", "2.0",
      "Timeout multiplier for resending trigger (must be >= "
      UCS_PP_MAKE_STRING(UCT_UD_MIN_TIMER_TIMER_BACKOFF) ")",
      ucs_offsetof(uct_ud_iface_config_t, timer_backoff),
                   UCS_CONFIG_TYPE_DOUBLE},
+
     {"ASYNC_TIMER_TICK", "100ms", "Resolution for async timer",
      ucs_offsetof(uct_ud_iface_config_t, event_timer_tick), UCS_CONFIG_TYPE_TIME},
+
+    {"MIN_POKE_TIME", "250ms",
+     "Minimal interval to send ACK request with solicited flag, to wake up\n"
+     "the remote peer in case it is not actively calling progress.\n"
+     "Smaller values may incur performance overhead, while extermely large\n"
+     "values can cause delays in presence of packet drops.",
+     ucs_offsetof(uct_ud_iface_config_t, min_poke_time), UCS_CONFIG_TYPE_TIME},
+
     {"ETH_DGID_CHECK", "y",
      "Enable checking destination GID for incoming packets of Ethernet network.\n"
      "Mismatched packets are silently dropped.",
@@ -669,6 +694,7 @@ ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface,
                                          UCT_IFACE_FLAG_CONNECT_TO_EP    |
                                          UCT_IFACE_FLAG_CONNECT_TO_IFACE |
                                          UCT_IFACE_FLAG_PENDING          |
+                                         UCT_IFACE_FLAG_EP_CHECK         |
                                          UCT_IFACE_FLAG_CB_SYNC          |
                                          UCT_IFACE_FLAG_CB_ASYNC         |
                                          UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE;
@@ -797,17 +823,26 @@ uct_ud_send_skb_t *uct_ud_iface_ctl_skb_get(uct_ud_iface_t *iface)
     return skb;
 }
 
-void uct_ud_iface_dispatch_async_comps_do(uct_ud_iface_t *iface)
+unsigned
+uct_ud_iface_dispatch_async_comps_do(uct_ud_iface_t *iface, uct_ud_ep_t *ep)
 {
-    uct_ud_comp_desc_t *cdesc;
+    unsigned count = 0;
     uct_ud_send_skb_t *skb;
+    uct_ud_comp_desc_t *cdesc;
 
     ucs_queue_for_each_extract(skb, &iface->tx.async_comp_q, queue, 1) {
         ucs_assert(!(skb->flags & UCT_UD_SEND_SKB_FLAG_RESENDING));
         cdesc = uct_ud_comp_desc(skb);
-        uct_ud_iface_dispatch_comp(iface, cdesc->comp, cdesc->status);
-        uct_ud_skb_release(skb, 0);
+        ucs_assert(cdesc->ep != NULL);
+
+        if ((ep == NULL) || (ep == cdesc->ep)) {
+            uct_ud_iface_dispatch_comp(iface, cdesc->comp);
+            uct_ud_skb_release(skb, 0);
+        }
+        ++count;
     }
+
+    return count;
 }
 
 static void uct_ud_iface_free_async_comps(uct_ud_iface_t *iface)
@@ -819,31 +854,27 @@ static void uct_ud_iface_free_async_comps(uct_ud_iface_t *iface)
     }
 }
 
-ucs_status_t uct_ud_iface_dispatch_pending_rx_do(uct_ud_iface_t *iface)
+unsigned uct_ud_iface_dispatch_pending_rx_do(uct_ud_iface_t *iface)
 {
-    int count;
+    unsigned max_poll = iface->super.config.rx_max_poll;
+    int count         = 0;
     uct_ud_recv_skb_t *skb;
     uct_ud_neth_t *neth;
-    unsigned max_poll = iface->super.config.rx_max_poll;
+    void *hdr;
 
-    count = 0;
     do {
-        skb = ucs_queue_pull_elem_non_empty(&iface->rx.pending_q, uct_ud_recv_skb_t, u.am.queue);
-        neth =  (uct_ud_neth_t *)((char *)uct_ib_iface_recv_desc_hdr(&iface->super,
-                                                                     (uct_ib_iface_recv_desc_t *)skb) +
-                                  UCT_IB_GRH_LEN);
-        uct_ib_iface_invoke_am_desc(&iface->super,
-                                    uct_ud_neth_get_am_id(neth),
-                                    neth + 1,
-                                    skb->u.am.len,
-                                    &skb->super);
-        count++;
-        if (count >= max_poll) {
-            return UCS_ERR_NO_RESOURCE;
-        }
-    } while (!ucs_queue_is_empty(&iface->rx.pending_q));
+        skb  = ucs_queue_pull_elem_non_empty(&iface->rx.pending_q,
+                                             uct_ud_recv_skb_t, u.am.queue);
+        hdr  = uct_ib_iface_recv_desc_hdr(&iface->super,
+                                          (uct_ib_iface_recv_desc_t*)skb);
+        neth = (uct_ud_neth_t*)UCS_PTR_BYTE_OFFSET(hdr, UCT_IB_GRH_LEN);
 
-    return UCS_OK;
+        uct_ib_iface_invoke_am_desc(&iface->super, uct_ud_neth_get_am_id(neth),
+                                    neth + 1, skb->u.am.len, &skb->super);
+        ++count;
+    } while ((count < max_poll) && !ucs_queue_is_empty(&iface->rx.pending_q));
+
+    return count;
 }
 
 static void uct_ud_iface_free_pending_rx(uct_ud_iface_t *iface)
@@ -875,6 +906,8 @@ ucs_status_t uct_ud_iface_event_arm(uct_iface_h tl_iface, unsigned events)
 
     status = uct_ib_iface_pre_arm(&iface->super);
     if (status != UCS_OK) {
+        ucs_trace("iface %p: pre arm failed status %s", iface,
+                  ucs_status_string(status));
         goto out;
     }
 
@@ -882,21 +915,35 @@ ucs_status_t uct_ud_iface_event_arm(uct_iface_h tl_iface, unsigned events)
     if ((events & (UCT_EVENT_RECV | UCT_EVENT_RECV_SIG)) &&
         !ucs_queue_is_empty(&iface->rx.pending_q))
     {
-        status = UCS_ERR_BUSY;
-        goto out;
-    }
-
-    /* Check if some send completions were not delivered yet */
-    if ((events & UCT_EVENT_SEND_COMP) &&
-        !ucs_queue_is_empty(&iface->tx.async_comp_q))
-    {
+        ucs_trace("iface %p: arm failed, has %lu unhandled receives", iface,
+                  ucs_queue_length(&iface->rx.pending_q));
         status = UCS_ERR_BUSY;
         goto out;
     }
 
     if (events & UCT_EVENT_SEND_COMP) {
+        /* Check if some send completions were not delivered yet */
+        if (!ucs_queue_is_empty(&iface->tx.async_comp_q)) {
+            ucs_trace("iface %p: arm failed, has %lu async send comp", iface,
+                      ucs_queue_length(&iface->tx.async_comp_q));
+            status = UCS_ERR_BUSY;
+            goto out;
+        }
+
+        /* Check if we have pending operations which need to be progressed */
+        if (iface->tx.async_before_pending) {
+            ucs_trace("iface %p: arm failed, has async-before-pending flag",
+                      iface);
+            status = UCS_ERR_BUSY;
+            goto out;
+        }
+    }
+
+    if (events & UCT_EVENT_SEND_COMP) {
         status = iface->super.ops->arm_cq(&iface->super, UCT_IB_DIR_TX, 0);
         if (status != UCS_OK) {
+            ucs_trace("iface %p: arm cq failed status %s", iface,
+                      ucs_status_string(status));
             goto out;
         }
     }
@@ -905,10 +952,13 @@ ucs_status_t uct_ud_iface_event_arm(uct_iface_h tl_iface, unsigned events)
         /* we may get send completion through ACKs as well */
         status = iface->super.ops->arm_cq(&iface->super, UCT_IB_DIR_RX, 0);
         if (status != UCS_OK) {
+            ucs_trace("iface %p: arm cq failed status %s", iface,
+                      ucs_status_string(status));
             goto out;
         }
     }
 
+    ucs_trace("iface %p: arm cq ok", iface);
     status = UCS_OK;
 out:
     uct_ud_leave(iface);

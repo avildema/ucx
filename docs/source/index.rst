@@ -1,4 +1,4 @@
-.. 
+..
 .. Copyright (C) Mellanox Technologies Ltd. 2019.  ALL RIGHTS RESERVED.
 ..
 .. See file LICENSE for terms.
@@ -9,12 +9,12 @@ OpenUCX
 *******
 
 Unified Communication X (UCX) is an `award winning <https://losalamosreporter.com/2019/11/07/nine-los-alamos-national-laboratory-projects-win-rd-100-awards>`_,
-optimized production proven communication framework for modern, high-bandwidth
+optimized production-proven communication framework for modern, high-bandwidth
 and low-latency networks.
 
-UCX exposes a set of abstract communication primitives which utilize the best of
+UCX exposes a set of abstract communication primitives that utilize the best of
 available hardware resources and offloads. These include RDMA (InfiniBand and RoCE),
-TCP, GPUs, shared Memory, and network atomic operations.
+TCP, GPUs, shared memory, and network atomic operations.
 
 UCX facilitates rapid development by providing a high-level API, masking the
 low-level details, while maintaining high-performance and scalability.
@@ -73,7 +73,7 @@ Documentation
 *************
 
 *  API doc: `HTML <https://openucx.github.io/ucx/api/v{VERSION}/html/index.html>`_ `PDF <https://openucx.github.io/ucx/api/v{VERSION}/ucx-v{VERSION}.pdf>`_
-* `Examples <https://github.com/openucx/ucx/tree/v{VERSION}.x/test/examples>`_
+* `Examples <https://github.com/openucx/ucx/tree/v{VERSION}.x/examples>`_
 
 
 Projects using UCX

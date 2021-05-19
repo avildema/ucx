@@ -102,9 +102,9 @@ static inline void
 uct_ud_verbs_ep_tx_inlv(uct_ud_verbs_iface_t *iface, uct_ud_verbs_ep_t *ep,
                         const void *buffer, unsigned length)
 {
-    iface->tx.sge[1].addr   = (uintptr_t)buffer;
-    iface->tx.sge[1].length = length;
-    ucs_assert(iface->tx.wr_inl.num_sge == 2);
+    iface->tx.sge[1].addr    = (uintptr_t)buffer;
+    iface->tx.sge[1].length  = length;
+    iface->tx.wr_inl.num_sge = 2;
     uct_ud_verbs_post_send(iface, ep, &iface->tx.wr_inl, IBV_SEND_INLINE, 2);
 }
 
@@ -193,6 +193,41 @@ ucs_status_t uct_ud_verbs_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t hdr,
                                  am_hdr+1, buffer, length);
     UCT_TL_EP_STAT_OP(&ep->super.super, AM, SHORT, sizeof(hdr) + length);
     uct_ud_leave(&iface->super);
+    return UCS_OK;
+}
+
+static ucs_status_t uct_ud_verbs_ep_am_short_iov(uct_ep_h tl_ep, uint8_t id,
+                                                 const uct_iov_t *iov, size_t iovcnt)
+{
+    uct_ud_verbs_ep_t *ep       = ucs_derived_of(tl_ep, uct_ud_verbs_ep_t);
+    uct_ud_verbs_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_ud_verbs_iface_t);
+    uct_ud_send_skb_t *skb;
+    ucs_status_t status;
+
+    UCT_CHECK_IOV_SIZE(iovcnt, (size_t)iface->config.max_send_sge,
+                       "uct_ud_verbs_ep_am_short_iov");
+    UCT_CHECK_LENGTH(sizeof(uct_ud_neth_t) + uct_iov_total_length(iov, iovcnt), 0,
+                     iface->super.config.max_inline, "am_short");
+
+    uct_ud_enter(&iface->super);
+
+    status = uct_ud_am_skb_common(&iface->super, &ep->super, id, &skb);
+    if (status != UCS_OK) {
+        uct_ud_leave(&iface->super);
+        return status;
+    }
+
+    skb->len = iface->tx.sge[0].length = sizeof(uct_ud_neth_t);
+    iface->tx.sge[0].addr              = (uintptr_t)skb->neth;
+    iface->tx.wr_inl.num_sge           = uct_ib_verbs_sge_fill_iov(iface->tx.sge + 1,
+                                                                    iov, iovcnt) + 1;
+    uct_ud_verbs_post_send(iface, ep, &iface->tx.wr_inl, IBV_SEND_INLINE,
+                           iface->tx.wr_inl.num_sge);
+
+    uct_ud_iface_complete_tx_skb(&iface->super, &ep->super, skb);
+    UCT_TL_EP_STAT_OP(&ep->super.super, AM, SHORT, uct_iov_total_length(iov, iovcnt));
+    uct_ud_leave(&iface->super);
+
     return UCS_OK;
 }
 
@@ -367,7 +402,7 @@ uct_ud_verbs_iface_poll_rx(uct_ud_verbs_iface_t *iface, int is_async)
 
     UCT_IB_IFACE_VERBS_FOREACH_RXWQE(&iface->super.super, i, packet, wc, num_wcs) {
         if (!uct_ud_iface_check_grh(&iface->super, packet,
-                                    wc[i].wc_flags & IBV_WC_GRH)) {
+                                    wc[i].wc_flags & IBV_WC_GRH, wc[i].sl)) {
             ucs_mpool_put_inline((void*)wc[i].wr_id);
             continue;
         }
@@ -384,13 +419,6 @@ uct_ud_verbs_iface_poll_rx(uct_ud_verbs_iface_t *iface, int is_async)
 out:
     uct_ud_verbs_iface_post_recv(iface);
     return num_wcs;
-}
-
-static ucs_status_t uct_ud_verbs_ep_set_failed(uct_ib_iface_t *iface,
-                                               uct_ep_h ep, ucs_status_t status)
-{
-    return uct_set_ep_failed(&UCS_CLASS_NAME(uct_ud_verbs_ep_t), ep,
-                             &iface->super.super, status);
 }
 
 static unsigned uct_ud_verbs_iface_async_progress(uct_ud_iface_t *ud_iface)
@@ -413,19 +441,18 @@ static unsigned uct_ud_verbs_iface_async_progress(uct_ud_iface_t *ud_iface)
 static unsigned uct_ud_verbs_iface_progress(uct_iface_h tl_iface)
 {
     uct_ud_verbs_iface_t *iface = ucs_derived_of(tl_iface, uct_ud_verbs_iface_t);
-    ucs_status_t status;
     unsigned count;
 
     uct_ud_enter(&iface->super);
-    uct_ud_iface_dispatch_async_comps(&iface->super);
-    status = uct_ud_iface_dispatch_pending_rx(&iface->super);
-    if (status == UCS_OK) {
+
+    count  = uct_ud_iface_dispatch_async_comps(&iface->super, NULL);
+    count += uct_ud_iface_dispatch_pending_rx(&iface->super);
+
+    if (ucs_likely(count == 0)) {
         count = uct_ud_verbs_iface_poll_rx(iface, 0);
         if (count == 0) {
-            count = uct_ud_verbs_iface_poll_tx(iface, 0);
+            count += uct_ud_verbs_iface_poll_tx(iface, 0);
         }
-    } else {
-        count = 0;
     }
 
     uct_ud_iface_progress_pending(&iface->super, 0);
@@ -519,19 +546,46 @@ uct_ud_verbs_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     return uct_ud_verbs_ep_t_new(params, ep_p);
 }
 
+static void uct_ud_verbs_iface_destroy_qp(uct_ud_iface_t *ud_iface)
+{
+    uct_ib_destroy_qp(ud_iface->qp);
+}
+
 static void UCS_CLASS_DELETE_FUNC_NAME(uct_ud_verbs_iface_t)(uct_iface_t*);
 
 static uct_ud_iface_ops_t uct_ud_verbs_iface_ops = {
-    {
-    {
+    .super = {
+        .super = {
+            .iface_estimate_perf = uct_base_iface_estimate_perf,
+            .iface_vfs_refresh   = (uct_iface_vfs_refresh_func_t)ucs_empty_function,
+        },
+        .create_cq      = uct_ib_verbs_create_cq,
+        .arm_cq         = uct_ib_iface_arm_cq,
+        .event_cq       = (uct_ib_iface_event_cq_func_t)ucs_empty_function,
+        .handle_failure = (uct_ib_iface_handle_failure_func_t)ucs_empty_function_do_assert,
+    },
+    .async_progress          = uct_ud_verbs_iface_async_progress,
+    .send_ctl                = uct_ud_verbs_ep_send_ctl,
+    .ep_free                 = UCS_CLASS_DELETE_FUNC_NAME(uct_ud_verbs_ep_t),
+    .create_qp               = uct_ib_iface_create_qp,
+    .destroy_qp              = uct_ud_verbs_iface_destroy_qp,
+    .unpack_peer_address     = uct_ud_verbs_iface_unpack_peer_address,
+    .ep_get_peer_address     = uct_ud_verbs_ep_get_peer_address,
+    .get_peer_address_length = uct_ud_verbs_get_peer_address_length,
+    .peer_address_str        = uct_ud_verbs_iface_peer_address_str,
+};
+
+static uct_iface_ops_t uct_ud_verbs_iface_tl_ops = {
     .ep_put_short             = uct_ud_verbs_ep_put_short,
     .ep_am_short              = uct_ud_verbs_ep_am_short,
+    .ep_am_short_iov          = uct_ud_verbs_ep_am_short_iov,
     .ep_am_bcopy              = uct_ud_verbs_ep_am_bcopy,
     .ep_am_zcopy              = uct_ud_verbs_ep_am_zcopy,
     .ep_pending_add           = uct_ud_ep_pending_add,
     .ep_pending_purge         = uct_ud_ep_pending_purge,
     .ep_flush                 = uct_ud_ep_flush,
     .ep_fence                 = uct_base_ep_fence,
+    .ep_check                 = uct_ud_ep_check,
     .ep_create                = uct_ud_verbs_ep_create,
     .ep_destroy               = uct_ud_ep_disconnect,
     .ep_get_address           = uct_ud_ep_get_address,
@@ -549,21 +603,6 @@ static uct_ud_iface_ops_t uct_ud_verbs_iface_ops = {
     .iface_get_device_address = uct_ib_iface_get_device_address,
     .iface_get_address        = uct_ud_iface_get_address,
     .iface_is_reachable       = uct_ib_iface_is_reachable
-    },
-    .create_cq                = uct_ib_verbs_create_cq,
-    .arm_cq                   = uct_ib_iface_arm_cq,
-    .event_cq                 = (uct_ib_iface_event_cq_func_t)ucs_empty_function,
-    .handle_failure           = (uct_ib_iface_handle_failure_func_t)ucs_empty_function_do_assert,
-    .set_ep_failed            = uct_ud_verbs_ep_set_failed,
-    },
-    .async_progress           = uct_ud_verbs_iface_async_progress,
-    .send_ctl                 = uct_ud_verbs_ep_send_ctl,
-    .ep_free                  = UCS_CLASS_DELETE_FUNC_NAME(uct_ud_verbs_ep_t),
-    .create_qp                = uct_ib_iface_create_qp,
-    .unpack_peer_address      = uct_ud_verbs_iface_unpack_peer_address,
-    .ep_get_peer_address      = uct_ud_verbs_ep_get_peer_address,
-    .get_peer_address_length  = uct_ud_verbs_get_peer_address_length,
-    .peer_address_str         = uct_ud_verbs_iface_peer_address_str
 };
 
 static UCS_F_NOINLINE void
@@ -624,18 +663,20 @@ static UCS_CLASS_INIT_FUNC(uct_ud_verbs_iface_t, uct_md_h md, uct_worker_h worke
                            const uct_iface_params_t *params,
                            const uct_iface_config_t *tl_config)
 {
-    uct_ud_iface_config_t *config = ucs_derived_of(tl_config,
-                                                   uct_ud_iface_config_t);
+    uct_ud_iface_config_t *config      = ucs_derived_of(tl_config,
+                                                        uct_ud_iface_config_t);
     uct_ib_iface_init_attr_t init_attr = {};
     ucs_status_t status;
 
     ucs_trace_func("");
 
-    init_attr.cq_len[UCT_IB_DIR_TX]   = config->super.tx.queue_len;
-    init_attr.cq_len[UCT_IB_DIR_RX]   = config->super.rx.queue_len;
+    init_attr.cq_len[UCT_IB_DIR_TX] = config->super.tx.queue_len;
+    init_attr.cq_len[UCT_IB_DIR_RX] = config->super.rx.queue_len;
 
-    UCS_CLASS_CALL_SUPER_INIT(uct_ud_iface_t, &uct_ud_verbs_iface_ops, md,
+    UCS_CLASS_CALL_SUPER_INIT(uct_ud_iface_t, &uct_ud_verbs_iface_ops, &uct_ud_verbs_iface_tl_ops, md,
                               worker, params, config, &init_attr);
+
+    self->super.super.config.sl       = uct_ib_iface_config_select_sl(&config->super);
 
     memset(&self->tx.wr_inl, 0, sizeof(self->tx.wr_inl));
     self->tx.wr_inl.opcode            = IBV_WR_SEND;
@@ -644,7 +685,6 @@ static UCS_CLASS_INIT_FUNC(uct_ud_verbs_iface_t, uct_md_h md, uct_worker_h worke
     self->tx.wr_inl.imm_data          = 0;
     self->tx.wr_inl.next              = 0;
     self->tx.wr_inl.sg_list           = self->tx.sge;
-    self->tx.wr_inl.num_sge           = 2;
 
     memset(&self->tx.wr_skb, 0, sizeof(self->tx.wr_skb));
     self->tx.wr_skb.opcode            = IBV_WR_SEND;
@@ -679,7 +719,6 @@ static UCS_CLASS_INIT_FUNC(uct_ud_verbs_iface_t, uct_md_h md, uct_worker_h worke
 static UCS_CLASS_CLEANUP_FUNC(uct_ud_verbs_iface_t)
 {
     ucs_trace_func("");
-    uct_ud_iface_remove_async_handlers(&self->super);
 }
 
 UCS_CLASS_DEFINE(uct_ud_verbs_iface_t, uct_ud_iface_t);

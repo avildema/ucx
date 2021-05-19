@@ -38,6 +38,10 @@ typedef struct ucs_topo_global_ctx {
 } ucs_topo_global_ctx_t;
 
 
+const ucs_sys_dev_distance_t ucs_topo_default_distance = {
+    .latency   = 0,
+    .bandwidth = DBL_MAX
+};
 static ucs_topo_global_ctx_t ucs_topo_ctx;
 
 static ucs_bus_id_bit_rep_t ucs_topo_get_bus_id_bit_repr(const ucs_sys_bus_id_t *bus_id)
@@ -59,6 +63,11 @@ void ucs_topo_cleanup()
 {
     kh_destroy_inplace(bus_to_sys_dev, &ucs_topo_ctx.bus_to_sys_dev_hash);
     ucs_spinlock_destroy(&ucs_topo_ctx.lock);
+}
+
+unsigned ucs_topo_num_devices()
+{
+    return ucs_topo_ctx.sys_dev_to_bus_lookup.count;
 }
 
 ucs_status_t ucs_topo_find_device_by_bus_id(const ucs_sys_bus_id_t *bus_id,
@@ -114,22 +123,23 @@ ucs_status_t ucs_topo_get_distance(ucs_sys_device_t device1,
     /* If one of the devices is unknown, we assume near topology */
     if ((device1 == UCS_SYS_DEVICE_ID_UNKNOWN) ||
         (device2 == UCS_SYS_DEVICE_ID_UNKNOWN) || (device1 == device2)) {
-        path_distance = 0;
-    } else {
-        if ((device1 >= ucs_topo_ctx.sys_dev_to_bus_lookup.count) ||
-            (device2 >= ucs_topo_ctx.sys_dev_to_bus_lookup.count)) {
-            return UCS_ERR_INVALID_PARAM;
-        }
+        goto default_distance;
+    }
 
-        ucs_topo_get_bus_path(&ucs_topo_ctx.sys_dev_to_bus_lookup.bus_arr[device1],
-                              path1, sizeof(path1));
-        ucs_topo_get_bus_path(&ucs_topo_ctx.sys_dev_to_bus_lookup.bus_arr[device2],
-                              path2, sizeof(path2));
+    if ((device1 >= ucs_topo_num_devices()) ||
+        (device2 >= ucs_topo_num_devices())) {
+        return UCS_ERR_INVALID_PARAM;
+    }
 
-        path_distance = ucs_path_calc_distance(path1, path2);
-        if (path_distance < 0) {
-            return (ucs_status_t)path_distance;
-        }
+    ucs_topo_get_bus_path(&ucs_topo_ctx.sys_dev_to_bus_lookup.bus_arr[device1],
+                          path1, sizeof(path1));
+    ucs_topo_get_bus_path(&ucs_topo_ctx.sys_dev_to_bus_lookup.bus_arr[device2],
+                          path2, sizeof(path2));
+
+    path_distance = ucs_path_calc_distance(path1, path2);
+    if (path_distance <= 0) {
+        /* Assume default distance for devices that cannot be found in sysfs */
+        goto default_distance;
     }
 
     /* Rough approximation of bandwidth/latency as function of PCI distance in
@@ -137,18 +147,28 @@ ucs_status_t ucs_topo_get_distance(ucs_sys_device_t device1,
      * TODO implement more accurate estimation, based on system type, PCIe
      * switch, etc.
      */
-    if (path_distance <= 2) {
-        distance->latency   = 0;
-        distance->bandwidth = DBL_MAX;
-    } else if (path_distance <= 4) {
-        distance->latency   = 300e-9;
-        distance->bandwidth = 2000 * UCS_MBYTE;
-    } else {
-        distance->latency   = 900e-9;
-        distance->bandwidth = 300 * UCS_MBYTE;
+    distance->latency   = 100e-9 * path_distance;
+    distance->bandwidth = (20000 / path_distance) * UCS_MBYTE;
+    return UCS_OK;
+
+default_distance:
+    *distance = ucs_topo_default_distance;
+    return UCS_OK;
+}
+
+const char *ucs_topo_distance_str(const ucs_sys_dev_distance_t *distance,
+                                  char *buffer, size_t max)
+{
+    UCS_STRING_BUFFER_FIXED(strb, buffer, max);
+
+    if (distance->bandwidth < 1e20) {
+        /* Print bandwidth only if limited */
+        ucs_string_buffer_appendf(&strb, "%.2fMBs/",
+                                  distance->bandwidth / UCS_MBYTE);
     }
 
-    return UCS_OK;
+    ucs_string_buffer_appendf(&strb, "%.0fns", distance->latency * 1e9);
+    return ucs_string_buffer_cstr(&strb);
 }
 
 const char *
@@ -160,14 +180,38 @@ ucs_topo_sys_device_bdf_name(ucs_sys_device_t sys_dev, char *buffer, size_t max)
         return "<unknown>";
     }
 
-    if (sys_dev >= ucs_topo_ctx.sys_dev_to_bus_lookup.count) {
-        return NULL;
+    if (sys_dev >= ucs_topo_num_devices()) {
+        return "<invalid>";
     }
 
     bus_id = &ucs_topo_ctx.sys_dev_to_bus_lookup.bus_arr[sys_dev];
     ucs_snprintf_safe(buffer, max, "%04x:%02x:%02x.%d", bus_id->domain,
                       bus_id->bus, bus_id->slot, bus_id->function);
     return buffer;
+}
+
+ucs_status_t
+ucs_topo_find_device_by_bdf_name(const char *name, ucs_sys_device_t *sys_dev)
+{
+    ucs_sys_bus_id_t bus_id;
+    int num_fields;
+
+    /* Try to parse as "<domain>:<bus>:<device>.<function>" */
+    num_fields = sscanf(name, "%hx:%hhx:%hhx.%hhx", &bus_id.domain, &bus_id.bus,
+                        &bus_id.slot, &bus_id.function);
+    if (num_fields == 4) {
+        return ucs_topo_find_device_by_bus_id(&bus_id, sys_dev);
+    }
+
+    /* Try to parse as "<bus>:<device>.<function>", assume domain is 0 */
+    bus_id.domain = 0;
+    num_fields    = sscanf(name, "%hhx:%hhx.%hhx", &bus_id.bus, &bus_id.slot,
+                           &bus_id.function);
+    if (num_fields == 3) {
+        return ucs_topo_find_device_by_bus_id(&bus_id, sys_dev);
+    }
+
+    return UCS_ERR_INVALID_PARAM;
 }
 
 void ucs_topo_print_info(FILE *stream)

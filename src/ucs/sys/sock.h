@@ -215,7 +215,7 @@ ucs_status_t ucs_socket_set_buffer_size(int fd, size_t sockopt_sndbuf,
  *                                for the listen() call.
  * @param [in]  silent_bind       Whether or not to print error message on bind
  *                                failure with EADDRINUSE.
- * @param [in]  allow_addr_inuse  Whether or not to allow the socket to use an
+ * @param [in]  reuse_addr        Whether or not to allow the socket to use an
  *                                address that is already in use and was not
  *                                released by another socket yet.
  * @param [out] listen_fd         The fd that belongs to the server.
@@ -223,7 +223,7 @@ ucs_status_t ucs_socket_set_buffer_size(int fd, size_t sockopt_sndbuf,
  * @return UCS_OK on success or an error code on failure.
  */
 ucs_status_t ucs_socket_server_init(const struct sockaddr *saddr, socklen_t socklen,
-                                    int backlog, int silent_bind, int allow_addr_inuse,
+                                    int backlog, int silent_bind, int reuse_addr,
                                     int *listen_fd);
 
 
@@ -322,7 +322,7 @@ ucs_status_t ucs_socket_recv(int fd, void *data, size_t length);
  * 
  * @param [in]   addr       Pointer to sockaddr structure.
  * @param [out]  size_p     Pointer to variable where size of
- *                          sockaddr_in/sockaddr_in6 structure will be written
+ *                          sockaddr_in/sockaddr_in6 structure will be written.
  *
  * @return UCS_OK on success or UCS_ERR_INVALID_PARAM on failure.
  */
@@ -334,7 +334,8 @@ ucs_status_t ucs_sockaddr_sizeof(const struct sockaddr *addr, size_t *size_p);
  * 
  * @param [in]   addr       Pointer to sockaddr structure.
  * @param [out]  port_p     Pointer to variable where port (host notation)
- *                          of sockaddr_in/sockaddr_in6 structure will be written
+ *                          of sockaddr_in/sockaddr_in6 structure will be
+ *                          written.
  *
  * @return UCS_OK on success or UCS_ERR_INVALID_PARAM on failure.
  */
@@ -345,7 +346,7 @@ ucs_status_t ucs_sockaddr_get_port(const struct sockaddr *addr, uint16_t *port_p
  * Set port to a given sockaddr structure.
  * 
  * @param [in]   addr       Pointer to sockaddr structure.
- * @param [in]   port       Port (host notation) that will be written
+ * @param [in]   port       Port (host notation) that will be written.
  *
  * @return UCS_OK on success or UCS_ERR_INVALID_PARAM on failure.
  */
@@ -364,17 +365,56 @@ const void *ucs_sockaddr_get_inet_addr(const struct sockaddr *addr);
 
 
 /**
+ * Set IP addr to a given sockaddr structure.
+ * 
+ * @param [in]   addr        Pointer to sockaddr structure.
+ * @param [in]   in_addr     IP address that will be written.
+ *
+ * @return UCS_OK on success or UCS_ERR_INVALID_PARAM on failure.
+ */
+ucs_status_t ucs_sockaddr_set_inet_addr(struct sockaddr *addr,
+                                        const void *in_addr);
+
+
+/**
+ * Return size of IP address of a given sockaddr structure.
+ * 
+ * @param [in]   addr       Pointer to sockaddr structure.
+ * @param [out]  size_p     Pointer to variable where size of IP address
+ *                          structure will be written.
+ *
+ * @return UCS_OK on success or UCS_ERR_INVALID_PARAM on failure.
+ */
+ucs_status_t ucs_sockaddr_inet_addr_sizeof(const struct sockaddr *addr,
+                                           size_t *size_p);
+
+
+/**
  * Extract the IP address from a given sockaddr and return it as a string.
  *
  * @param [in]   sock_addr   Sockaddr to take IP address from.
  * @param [out]  str         A string filled with the IP address.
  * @param [in]   max_size    Size of a string (considering '\0'-terminated symbol)
  *
- * @return ip_str if the sock_addr has a valid IP address or 'Invalid address'
- *         otherwise.
+ * @return '<null>' if NULL is specified or @a str if the sock_addr has a valid
+ *         IP address or 'Invalid address' otherwise.
  */
 const char* ucs_sockaddr_str(const struct sockaddr *sock_addr,
                              char *str, size_t max_size);
+
+
+/**
+ * Extract the IP address from a given string and return it as a sockaddr storage.
+ *
+ * @param [in]  ip_str       A string to take IP address from.
+ * @param [out] sa_storage   sockaddr storage filled with the IP address and
+ *                           address family.
+ *
+ * @return UCS_OK if @a ip_str has a valid IP address or UCS_ERR_INVALID_ADDR
+ *         otherwise.
+ */
+ucs_status_t ucs_sock_ipstr_to_sockaddr(const char *ip_str,
+                                        struct sockaddr_storage *sa_storage);
 
 
 /**
@@ -436,14 +476,26 @@ int ucs_sockaddr_ip_cmp(const struct sockaddr *sa1, const struct sockaddr *sa2);
 
 
 /**
- * Indicate if given IP addr is INADDR_ANY (IPV4) or in6addr_any (IPV6)
+ * Indicate if given IP address is INADDR_ANY (IPV4) or in6addr_any (IPV6)
  * 
  * @param [in]   addr       Pointer to sockaddr structure.
  *
  * @return 1 if input is INADDR_ANY or in6addr_any
  *         0 if not
  */
-int ucs_sockaddr_is_inaddr_any(struct sockaddr *addr);
+int ucs_sockaddr_is_inaddr_any(const struct sockaddr *addr);
+
+
+/**
+ * Indicate if given IP address is INADDR_LOOPBACK (IPV4) or in6addr_loopback
+ * (IPV6)
+ * 
+ * @param [in]   addr       Pointer to sockaddr structure.
+ *
+ * @return 1 if input is INADDR_LOOPBACK or in6addr_loopback
+ *         0 if not
+ */
+int ucs_sockaddr_is_inaddr_loopback(const struct sockaddr *addr);
 
 
 /**
@@ -488,6 +540,20 @@ const char *ucs_sockaddr_address_family_str(sa_family_t af);
  * @return UCS_OK or error in case of failure.
  */
 ucs_status_t ucs_sockaddr_get_ip_local_port_range(ucs_range_spec_t *port_range);
+
+
+/**
+ * Get IP address of a given sockaddr structure.
+ * 
+ * @param [in]  addr     Pointer to the sockaddr structure.
+ * @param [out] str      A string filled with the IP address.
+ * @param [in]  max_size Size of the string including terminating
+ *                       null-character.
+ *
+ * @return UCS_OK on success or UCS_ERR_INVALID_PARAM on failure.
+ */
+ucs_status_t
+ucs_sockaddr_get_ipstr(const struct sockaddr *addr, char *str, size_t max_size);
 
 END_C_DECLS
 

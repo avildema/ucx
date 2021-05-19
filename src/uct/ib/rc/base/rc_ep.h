@@ -10,7 +10,7 @@
 #include "rc_iface.h"
 
 #include <uct/api/uct.h>
-#include <ucs/debug/debug.h>
+#include <ucs/debug/debug_int.h>
 
 
 #define RC_UNSIGNALED_INF UINT16_MAX
@@ -42,32 +42,38 @@ enum {
     /* Keepalive Request scheduled: indicates that keepalive request
      * is scheduled in pending queue and no more keepalive actions
      * are needed */
-    UCT_RC_EP_FLAG_KEEPALIVE_PENDING = UCS_BIT(0),
+    UCT_RC_EP_FLAG_KEEPALIVE_PENDING   = UCS_BIT(0),
 
     /* EP is connected to peer */
-    UCT_RC_EP_FLAG_CONNECTED         = UCS_BIT(1),
+    UCT_RC_EP_FLAG_CONNECTED           = UCS_BIT(1),
+
+    /* Flush cancel was executed on EP */
+    UCT_RC_EP_FLAG_FLUSH_CANCEL        = UCS_BIT(2),
+
+    /* Error handler already called or flush(CANCEL) disabled it */
+    UCT_RC_EP_FLAG_ERR_HANDLER_INVOKED = UCS_BIT(3),
 
     /* Soft Credit Request: indicates that peer needs to piggy-back credits
      * grant to counter AM (if any). Can be bundled with
      * UCT_RC_EP_FLAG_FC_GRANT  */
-    UCT_RC_EP_FLAG_FC_SOFT_REQ       = UCS_BIT(UCT_AM_ID_BITS),
+    UCT_RC_EP_FLAG_FC_SOFT_REQ         = UCS_BIT(UCT_AM_ID_BITS),
 
     /* Hard Credit Request: indicates that wnd is close to be exhausted.
      * The peer must send separate AM with credit grant as soon as it
      * receives AM  with this bit set. Can be bundled with
      * UCT_RC_EP_FLAG_FC_GRANT */
-    UCT_RC_EP_FLAG_FC_HARD_REQ       = UCS_BIT((UCT_AM_ID_BITS) + 1),
+    UCT_RC_EP_FLAG_FC_HARD_REQ         = UCS_BIT((UCT_AM_ID_BITS) + 1),
 
     /* Credit Grant: ep should update its FC wnd as soon as it receives AM with
      * this bit set. Can be bundled with either soft or hard request bits */
-    UCT_RC_EP_FLAG_FC_GRANT          = UCS_BIT((UCT_AM_ID_BITS) + 2),
+    UCT_RC_EP_FLAG_FC_GRANT            = UCS_BIT((UCT_AM_ID_BITS) + 2),
 
     /* Special FC AM with Credit Grant: Just an empty message indicating
      * credit grant. Can't be bundled with any other FC flag (as it consumes
      * all 3 FC bits). */
-    UCT_RC_EP_FC_PURE_GRANT          = (UCT_RC_EP_FLAG_FC_HARD_REQ |
-                                        UCT_RC_EP_FLAG_FC_SOFT_REQ |
-                                        UCT_RC_EP_FLAG_FC_GRANT)
+    UCT_RC_EP_FC_PURE_GRANT            = (UCT_RC_EP_FLAG_FC_HARD_REQ |
+                                          UCT_RC_EP_FLAG_FC_SOFT_REQ |
+                                          UCT_RC_EP_FLAG_FC_GRANT)
 };
 
 /*
@@ -277,6 +283,9 @@ void uct_rc_txqp_purge_outstanding(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp,
 ucs_status_t uct_rc_ep_flush(uct_rc_ep_t *ep, int16_t max_available,
                              unsigned flags);
 
+ucs_status_t
+uct_rc_ep_check(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
+
 void uct_rc_ep_cleanup_qp(uct_rc_iface_t *iface, uct_rc_ep_t *ep,
                           uct_rc_ep_cleanup_ctx_t *cleanup_ctx, uint32_t qp_num);
 
@@ -296,6 +305,7 @@ ucs_status_t uct_rc_txqp_init(uct_rc_txqp_t *txqp, uct_rc_iface_t *iface,
                               uint32_t qp_num
                               UCS_STATS_ARG(ucs_stats_node_t* stats_parent));
 void uct_rc_txqp_cleanup(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp);
+void uct_rc_txqp_vfs_populate(uct_rc_txqp_t *txqp, void *parent_obj);
 
 static inline int16_t uct_rc_txqp_available(uct_rc_txqp_t *txqp)
 {
@@ -380,6 +390,16 @@ uct_rc_txqp_add_send_comp(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp,
     uct_rc_txqp_add_send_op_sn(txqp, op, sn);
 }
 
+static inline void
+uct_rc_ep_init_send_op(uct_rc_iface_send_op_t *op, unsigned flags,
+                            uct_completion_t *comp,
+                            uct_rc_send_handler_t handler)
+{
+    op->flags     = flags;
+    op->user_comp = comp;
+    op->handler   = handler;
+}
+
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_rc_txqp_add_flush_comp(uct_rc_iface_t *iface, uct_base_ep_t *ep,
                            uct_rc_txqp_t *txqp, uct_completion_t *comp,
@@ -394,13 +414,11 @@ uct_rc_txqp_add_flush_comp(uct_rc_iface_t *iface, uct_base_ep_t *ep,
             return UCS_ERR_NO_MEMORY;
         }
 
-        op->flags     = 0;
-        op->user_comp = comp;
+        uct_rc_ep_init_send_op(op, 0, comp, uct_rc_ep_flush_op_completion_handler);
+        op->iface = iface;
         uct_rc_txqp_add_send_op_sn(txqp, op, sn);
-        VALGRIND_MAKE_MEM_DEFINED(op, sizeof(*op)); /* handler set by mpool init */
     }
     UCT_TL_EP_STAT_FLUSH_WAIT(ep);
-
     return UCS_INPROGRESS;
 }
 

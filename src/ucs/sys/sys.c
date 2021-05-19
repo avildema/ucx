@@ -836,6 +836,8 @@ ucs_status_t ucs_sysv_alloc(size_t *size, size_t max_size, void **address_p,
     ssize_t huge_page_size;
 #endif
     size_t alloc_size;
+    void *shmat_address;
+    int shmat_flags;
     int sys_errno;
     void *ptr;
     int ret;
@@ -888,13 +890,17 @@ ucs_status_t ucs_sysv_alloc(size_t *size, size_t max_size, void **address_p,
     /* Attach segment */
     if (*address_p) {
 #ifdef SHM_REMAP
-        ptr = shmat(*shmid, *address_p, SHM_REMAP);
+        shmat_address = *address_p;
+        shmat_flags   = SHM_REMAP;
 #else
         return UCS_ERR_INVALID_PARAM;
 #endif
     } else {
-        ptr = shmat(*shmid, NULL, 0);
+        shmat_address = NULL;
+        shmat_flags   = 0;
     }
+
+    ptr = shmat(*shmid, shmat_address, shmat_flags);
 
     /* Remove segment, the attachment keeps a reference to the mapping */
     /* FIXME having additional attaches to a removed segment is not portable
@@ -911,7 +917,9 @@ ucs_status_t ucs_sysv_alloc(size_t *size, size_t max_size, void **address_p,
         } else if (RUNNING_ON_VALGRIND && (errno == EINVAL)) {
             return UCS_ERR_NO_MEMORY;
         } else {
-            ucs_error("shmat(shmid=%d) returned unexpected error: %m", *shmid);
+            ucs_error("shmat(shmid=%d, address=%p, flags=0x%x) returned "
+                      "unexpected error: %m",
+                      *shmid, shmat_address, shmat_flags);
             return UCS_ERR_SHMEM_SEGMENT;
         }
     }
@@ -1402,6 +1410,20 @@ ucs_status_t ucs_sys_get_boot_id(uint64_t *high, uint64_t *low)
     }
 
     return status;
+}
+
+uint64_t ucs_iface_get_system_id()
+{
+    uint64_t high;
+    uint64_t low;
+    ucs_status_t status;
+
+    status = ucs_sys_get_boot_id(&high, &low);
+    if (status == UCS_OK) {
+        return high ^ low;
+    }
+
+    return ucs_machine_guid();
 }
 
 ucs_status_t ucs_sys_readdir(const char *path, ucs_sys_readdir_cb_t cb, void *ctx)

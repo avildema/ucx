@@ -24,8 +24,10 @@ public:
     ucp_ep_params_t get_ep_params();
 
 protected:
+    static const int AM_ID = 0;
+
     enum {
-        TEST_TAG = UCS_BIT(0),
+        TEST_AM  = UCS_BIT(0),
         TEST_RMA = UCS_BIT(1),
         FAIL_IMM = UCS_BIT(2)
     };
@@ -37,6 +39,10 @@ protected:
 
     typedef ucs::handle<ucp_mem_h, ucp_context_h> mem_handle_t;
 
+    void set_am_handler(entity &e);
+    static ucs_status_t
+    am_callback(void *arg, const void *header, size_t header_length, void *data,
+                size_t length, const ucp_am_recv_param_t *param);
     void set_timeouts();
     static void err_cb(void *arg, ucp_ep_h ep, ucs_status_t status);
     ucp_ep_h stable_sender();
@@ -44,7 +50,6 @@ protected:
     entity& stable_receiver();
     entity& failing_receiver();
     void *send_nb(ucp_ep_h ep, ucp_rkey_h rkey);
-    void *recv_nb(entity& e);
     static ucs_log_func_rc_t
     warn_unreleased_rdesc_handler(const char *file, unsigned line,
                                   const char *function,
@@ -57,15 +62,14 @@ protected:
     void get_rkey(ucp_ep_h ep, entity& dst, mem_handle_t& memh,
                   ucs::handle<ucp_rkey_h>& rkey);
     void set_rkeys();
-    static void send_cb(void *request, ucs_status_t status);
-    static void recv_cb(void *request, ucs_status_t status,
-                        ucp_tag_recv_info_t *info);
+    static void send_cb(void *request, ucs_status_t status, void *user_data);
 
     virtual void cleanup();
 
     void do_test(size_t msg_size, int pre_msg_count, bool force_close,
                  bool request_must_fail);
 
+    size_t                              m_am_rx_count;
     size_t                              m_err_count;
     ucs_status_t                        m_err_status;
     std::string                         m_sbuf, m_rbuf;
@@ -77,16 +81,20 @@ protected:
 UCP_INSTANTIATE_TEST_CASE(test_ucp_peer_failure)
 
 
-test_ucp_peer_failure::test_ucp_peer_failure() : m_err_count(0), m_err_status(UCS_OK) {
+test_ucp_peer_failure::test_ucp_peer_failure() :
+    m_am_rx_count(0), m_err_count(0), m_err_status(UCS_OK)
+{
     ucs::fill_random(m_sbuf);
     set_timeouts();
 }
 
-void test_ucp_peer_failure::get_test_variants(std::vector<ucp_test_variant>& variants) {
-    add_variant_with_value(variants, UCP_FEATURE_TAG, TEST_TAG, "tag");
+void test_ucp_peer_failure::get_test_variants(
+        std::vector<ucp_test_variant> &variants)
+{
+    add_variant_with_value(variants, UCP_FEATURE_AM, TEST_AM, "am");
     add_variant_with_value(variants, UCP_FEATURE_RMA, TEST_RMA, "rma");
-    add_variant_with_value(variants, UCP_FEATURE_TAG, TEST_TAG | FAIL_IMM,
-                           "tag_fail_imm");
+    add_variant_with_value(variants, UCP_FEATURE_AM, TEST_AM | FAIL_IMM,
+                           "am_fail_imm");
     add_variant_with_value(variants, UCP_FEATURE_RMA, TEST_RMA | FAIL_IMM,
                            "rma_fail_imm");
 }
@@ -102,16 +110,43 @@ ucp_ep_params_t test_ucp_peer_failure::get_ep_params() {
     return params;
 }
 
+void test_ucp_peer_failure::set_am_handler(entity &e)
+{
+    if (!(get_variant_value() & TEST_AM)) {
+        return;
+    }
+
+    ucp_am_handler_param_t param;
+    param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
+                       UCP_AM_HANDLER_PARAM_FIELD_CB |
+                       UCP_AM_HANDLER_PARAM_FIELD_ARG;
+    param.cb         = am_callback;
+    param.arg        = this;
+    param.id         = AM_ID;
+
+    ucs_status_t status = ucp_worker_set_am_recv_handler(e.worker(), &param);
+    ASSERT_UCS_OK(status);
+}
+
+ucs_status_t
+test_ucp_peer_failure::am_callback(void *arg, const void *header,
+                                   size_t header_length, void *data,
+                                   size_t length,
+                                   const ucp_am_recv_param_t *param)
+{
+    test_ucp_peer_failure *self = reinterpret_cast<test_ucp_peer_failure*>(arg);
+    ++self->m_am_rx_count;
+    return UCS_OK;
+}
+
 void test_ucp_peer_failure::set_timeouts() {
-    /* Set small TL timeouts to reduce testing time */
-    m_env.push_back(new ucs::scoped_setenv("UCX_RC_TIMEOUT",     "10ms"));
-    m_env.push_back(new ucs::scoped_setenv("UCX_RC_RNR_TIMEOUT", "10ms"));
-    m_env.push_back(new ucs::scoped_setenv("UCX_RC_RETRY_COUNT", "2"));
+    set_tl_timeouts(m_env);
 }
 
 void test_ucp_peer_failure::err_cb(void *arg, ucp_ep_h ep, ucs_status_t status) {
     test_ucp_peer_failure *self = reinterpret_cast<test_ucp_peer_failure*>(arg);
-    EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT, status);
+    EXPECT_TRUE((UCS_ERR_CONNECTION_RESET == status) ||
+                (UCS_ERR_ENDPOINT_TIMEOUT == status));
     self->m_err_status = status;
     ++self->m_err_count;
 }
@@ -134,25 +169,19 @@ ucp_test::entity& test_ucp_peer_failure::failing_receiver() {
     return m_entities.at(m_entities.size() - 1 - FAILING_EP_INDEX);
 }
 
-void *test_ucp_peer_failure::send_nb(ucp_ep_h ep, ucp_rkey_h rkey) {
-    if (get_variant_value() & TEST_TAG) {
-        return ucp_tag_send_nb(ep, &m_sbuf[0], m_sbuf.size(), DATATYPE, 0,
-                               send_cb);
+void *test_ucp_peer_failure::send_nb(ucp_ep_h ep, ucp_rkey_h rkey)
+{
+    ucp_request_param_t param;
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE |
+                         UCP_OP_ATTR_FIELD_CALLBACK;
+    param.datatype     = DATATYPE;
+    param.cb.send      = send_cb;
+    if (get_variant_value() & TEST_AM) {
+        return ucp_am_send_nbx(ep, AM_ID, NULL, 0, &m_sbuf[0], m_sbuf.size(),
+                               &param);
     } else if (get_variant_value() & TEST_RMA) {
-        return ucp_put_nb(ep, &m_sbuf[0], m_sbuf.size(), (uintptr_t)&m_rbuf[0],
-                          rkey, send_cb);
-    } else {
-        ucs_fatal("invalid test case");
-    }
-}
-
-void *test_ucp_peer_failure::recv_nb(entity& e) {
-    ucs_assert(m_rbuf.size() >= m_sbuf.size());
-    if (get_variant_value() & TEST_TAG) {
-        return ucp_tag_recv_nb(e.worker(), &m_rbuf[0], m_rbuf.size(), DATATYPE, 0,
-                               0, recv_cb);
-    } else if (get_variant_value() & TEST_RMA) {
-        return NULL;
+        return ucp_put_nbx(ep, &m_sbuf[0], m_sbuf.size(), (uintptr_t)&m_rbuf[0],
+                           rkey, &param);
     } else {
         ucs_fatal("invalid test case");
     }
@@ -195,13 +224,27 @@ void test_ucp_peer_failure::fail_receiver() {
     }
 }
 
-void test_ucp_peer_failure::smoke_test(bool stable_pair) {
-    void *rreq = recv_nb(stable_pair ? stable_receiver() : failing_receiver());
-    void *sreq = send_nb(stable_pair ? stable_sender()   : failing_sender(),
-                         stable_pair ? m_stable_rkey     : m_failing_rkey);
+void test_ucp_peer_failure::smoke_test(bool stable_pair)
+{
+    ucp_ep_h send_ep = stable_pair ? stable_sender() : failing_sender();
+    size_t am_count  = m_am_rx_count;
+
+    // Send and wait for completion
+    void *sreq = send_nb(send_ep, stable_pair ? m_stable_rkey : m_failing_rkey);
     request_wait(sreq);
-    request_wait(rreq);
-    EXPECT_EQ(m_sbuf, m_rbuf);
+
+    if (get_variant_value() & TEST_AM) {
+        // Wait for active message to be received
+        while (m_am_rx_count < am_count) {
+            progress();
+        }
+    } else if (get_variant_value() & TEST_RMA) {
+        // Flush the sender and expect data to arrive on receiver
+        void *freq = ucp_ep_flush_nb(send_ep, 0,
+                                     (ucp_send_callback_t)ucs_empty_function);
+        request_wait(freq);
+        EXPECT_EQ(m_sbuf, m_rbuf);
+    }
 }
 
 void test_ucp_peer_failure::unmap_memh(ucp_mem_h memh, ucp_context_h context)
@@ -250,12 +293,8 @@ void test_ucp_peer_failure::set_rkeys() {
     }
 }
 
-void test_ucp_peer_failure::send_cb(void *request, ucs_status_t status)
-{
-}
-
-void test_ucp_peer_failure::recv_cb(void *request, ucs_status_t status,
-                                    ucp_tag_recv_info_t *info)
+void test_ucp_peer_failure::send_cb(void *request, ucs_status_t status,
+                                    void *user_data)
 {
 }
 
@@ -279,6 +318,8 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
     create_entity();
     sender().connect(&stable_receiver(),  get_ep_params(), STABLE_EP_INDEX);
     sender().connect(&failing_receiver(), get_ep_params(), FAILING_EP_INDEX);
+    set_am_handler(stable_receiver());
+    set_am_handler(failing_receiver());
 
     set_rkeys();
 
@@ -303,8 +344,9 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
         }
     }
 
+    flush_ep(sender(), 0, FAILING_EP_INDEX);
     EXPECT_EQ(UCS_OK, m_err_status);
-    
+
     /* Since UCT/UD EP has a SW implementation of reliablity on which peer
      * failure mechanism is based, we should set small UCT/UD EP timeout
      * for UCT/UD EPs for sender's UCP EP to reduce testing time */
@@ -316,7 +358,7 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
         fail_receiver();
 
         void *sreq = send_nb(failing_sender(), m_failing_rkey);
-
+        flush_ep(sender(), 0, FAILING_EP_INDEX);
         while (!m_err_count) {
             progress();
         }
@@ -331,7 +373,8 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
             ucs_status_t status = ucp_request_check_status(sreq);
             EXPECT_NE(UCS_INPROGRESS, status);
             if (request_must_fail) {
-                EXPECT_EQ(m_err_status, status);
+                EXPECT_TRUE((m_err_status == status) ||
+                            (UCS_ERR_CANCELED == status));
             } else {
                 EXPECT_TRUE((m_err_status == status) || (UCS_OK == status));
             }
@@ -339,9 +382,10 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
         }
 
         /* Additional sends must fail */
-        void *sreq2 = send_nb(failing_sender(), m_failing_rkey);
-        EXPECT_FALSE(UCS_PTR_IS_PTR(sreq2));
-        EXPECT_EQ(m_err_status, UCS_PTR_STATUS(sreq2));
+        void *sreq2         = send_nb(failing_sender(), m_failing_rkey);
+        ucs_status_t status = request_wait(sreq2);
+        EXPECT_TRUE(UCS_STATUS_IS_ERR(status));
+        EXPECT_EQ(m_err_status, status);
 
         if (force_close) {
             unsigned allocd_eps_before =
@@ -353,6 +397,7 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
 
             void *creq = ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FORCE);
             request_wait(creq);
+            short_progress_loop(); /* allow discard lanes & complete destroy EP */
 
             unsigned allocd_eps_after =
                     ucs_strided_alloc_inuse_count(&sender().worker()->ep_alloc);
@@ -381,15 +426,8 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
     /* Check that TX polling is working well */
     while (sender().progress());
 
-    /* Destroy rkeys before destroying the worker (which also destroys the
-     * endpoints) */
+    /* Destroy rkey for failing pair */
     m_failing_rkey.reset();
-    m_stable_rkey.reset();
-
-    /* When all requests on sender are done we need to prevent LOCAL_FLUSH
-     * in test teardown. Receiver is killed and doesn't respond on FC requests
-     */
-    sender().destroy_worker();
 }
 
 UCS_TEST_P(test_ucp_peer_failure, basic) {
@@ -427,34 +465,15 @@ UCS_TEST_P(test_ucp_peer_failure, bcopy_multi, "SEG_SIZE?=512", "RC_TM_ENABLE?=n
             false /* must_fail */);
 }
 
-UCS_TEST_P(test_ucp_peer_failure, force_close, "RC_FC_ENABLE?=n") {
+UCS_TEST_P(test_ucp_peer_failure, force_close, "RC_FC_ENABLE?=n",
+           /* To catch unexpected descriptors leak, for multi-fragment protocol
+              with TCP */
+           "TCP_RX_SEG_SIZE?=1024", "TCP_TX_SEG_SIZE?=1024")
+{
     do_test(16000, /* msg_size */
             1000, /* pre_msg_cnt */
             true, /* force_close */
             false /* must_fail */);
-}
-
-UCS_TEST_SKIP_COND_P(test_ucp_peer_failure, disable_sync_send,
-                     !(get_variant_value() & TEST_TAG)) {
-    const size_t        max_size = UCS_MBYTE;
-    std::vector<char>   buf(max_size, 0);
-    void                *req;
-
-    sender().connect(&receiver(), get_ep_params());
-
-    /* Make sure API is disabled for any size and data type */
-    for (size_t size = 1; size <= max_size; size *= 2) {
-        req = ucp_tag_send_sync_nb(sender().ep(), buf.data(), size, DATATYPE,
-                                   0x111337, NULL);
-        EXPECT_FALSE(UCS_PTR_IS_PTR(req));
-        EXPECT_EQ(UCS_ERR_UNSUPPORTED, UCS_PTR_STATUS(req));
-
-        ucp::data_type_desc_t dt_desc(DATATYPE_IOV, buf.data(), size);
-        req = ucp_tag_send_sync_nb(sender().ep(), dt_desc.buf(), dt_desc.count(),
-                                   dt_desc.dt(), 0x111337, NULL);
-        EXPECT_FALSE(UCS_PTR_IS_PTR(req));
-        EXPECT_EQ(UCS_ERR_UNSUPPORTED, UCS_PTR_STATUS(req));
-    }
 }
 
 class test_ucp_peer_failure_keepalive : public test_ucp_peer_failure
@@ -463,6 +482,9 @@ public:
     test_ucp_peer_failure_keepalive() {
         m_sbuf.resize(1 * UCS_MBYTE);
         m_rbuf.resize(1 * UCS_MBYTE);
+
+        m_env.push_back(new ucs::scoped_setenv("UCX_TCP_KEEPIDLE", "inf"));
+        m_env.push_back(new ucs::scoped_setenv("UCX_UD_TIMEOUT", "3s"));
     }
 
     void init() {
@@ -472,20 +494,24 @@ public:
         sender().connect(&failing_receiver(), get_ep_params(), FAILING_EP_INDEX);
         stable_receiver().connect(&sender(), get_ep_params());
         failing_receiver().connect(&sender(), get_ep_params());
+        set_am_handler(failing_receiver());
+        set_am_handler(stable_receiver());
     }
 
     static void get_test_variants(std::vector<ucp_test_variant>& variants) {
-        add_variant_with_value(variants, UCP_FEATURE_TAG, TEST_TAG, "tag");
+        add_variant_with_value(variants, UCP_FEATURE_AM, TEST_AM, "am");
     }
 };
 
 UCS_TEST_P(test_ucp_peer_failure_keepalive, kill_receiver,
-           "KEEPALIVE_TIMEOUT=0.3", "KEEPALIVE_NUM_EPS=inf") {
+           "KEEPALIVE_INTERVAL=0.3", "KEEPALIVE_NUM_EPS=inf") {
     /* TODO: wireup is not tested yet */
 
     scoped_log_handler err_handler(wrap_errors_logger);
     scoped_log_handler warn_handler(hide_warns_logger);
 
+    /* initiate p2p pairing */
+    ucp_ep_resolve_remote_id(failing_sender(), 0);
     smoke_test(true); /* allow wireup to complete */
     smoke_test(false);
 
@@ -504,7 +530,7 @@ UCS_TEST_P(test_ucp_peer_failure_keepalive, kill_receiver,
     /* flush all outstanding ops to allow keepalive to run */
     flush_worker(sender());
 
-    /* kill EPs */
+    /* kill EPs & ifaces */
     failing_receiver().close_all_eps(*this, 0, UCP_EP_CLOSE_MODE_FORCE);
     wait_for_flag(&m_err_count);
 

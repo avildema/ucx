@@ -45,33 +45,43 @@
 #include <string.h>
 
 
-#define UCT_IB_MLX5_WQE_SEG_SIZE        16 /* Size of a segment in a WQE */
-#define UCT_IB_MLX5_CQE64_MAX_INL       32 /* Inline scatter size in 64-byte CQE */
-#define UCT_IB_MLX5_CQE128_MAX_INL      64 /* Inline scatter size in 128-byte CQE */
-#define UCT_IB_MLX5_CQE64_SIZE_LOG      6
-#define UCT_IB_MLX5_CQE128_SIZE_LOG     7
-#define UCT_IB_MLX5_MAX_BB              4
-#define UCT_IB_MLX5_WORKER_BF_KEY       0x00c1b7e8u
-#define UCT_IB_MLX5_DEVX_UAR_KEY        0xdea1ab1eU
-#define UCT_IB_MLX5_RES_DOMAIN_KEY      0x1b1bda7aU
-#define UCT_IB_MLX5_WORKER_DM_KEY       0xacdf1245u
-#define UCT_IB_MLX5_EXTENDED_UD_AV      0x80 /* htonl(0x80000000) */
-#define UCT_IB_MLX5_AV_GRH_PRESENT      0x40 /* htonl(UCS_BIT(30)) */
-#define UCT_IB_MLX5_BF_REG_SIZE         256
-#define UCT_IB_MLX5_CQE_VENDOR_SYND_ODP 0x93
-#define UCT_IB_MLX5_CQE_VENDOR_SYND_PSN 0x99
-#define UCT_IB_MLX5_CQE_OP_OWN_ERR_MASK 0x80
-#define UCT_IB_MLX5_MAX_SEND_WQE_SIZE   (UCT_IB_MLX5_MAX_BB * MLX5_SEND_WQE_BB)
-#define UCT_IB_MLX5_CQ_SET_CI           0
-#define UCT_IB_MLX5_CQ_ARM_DB           1
-#define UCT_IB_MLX5_LOG_MAX_MSG_SIZE    30
-#define UCT_IB_MLX5_ATOMIC_MODE         3
-#define UCT_IB_MLX5_CQE_FLAG_L3_IN_DATA UCS_BIT(28) /* GRH/IP in the receive buffer */
-#define UCT_IB_MLX5_CQE_FLAG_L3_IN_CQE  UCS_BIT(29) /* GRH/IP in the CQE */
-#define UCT_IB_MLX5_MP_RQ_BYTE_CNT_MASK 0x0000FFFF  /* Byte count mask for multi-packet RQs */
-#define UCT_IB_MLX5_MP_RQ_LAST_MSG_FLAG UCS_BIT(30) /* MP last packet indication */
-#define UCT_IB_MLX5_MP_RQ_FILLER_FLAG   UCS_BIT(31) /* Filler CQE indicator */
+#define UCT_IB_MLX5_WQE_SEG_SIZE         16 /* Size of a segment in a WQE */
+#define UCT_IB_MLX5_CQE64_MAX_INL        32 /* Inline scatter size in 64-byte CQE */
+#define UCT_IB_MLX5_CQE128_MAX_INL       64 /* Inline scatter size in 128-byte CQE */
+#define UCT_IB_MLX5_CQE64_SIZE_LOG       6
+#define UCT_IB_MLX5_CQE128_SIZE_LOG      7
+#define UCT_IB_MLX5_MAX_BB               4
+#define UCT_IB_MLX5_WORKER_BF_KEY        0x00c1b7e8u
+#define UCT_IB_MLX5_DEVX_UAR_KEY         0xdea1ab1eU
+#define UCT_IB_MLX5_RES_DOMAIN_KEY       0x1b1bda7aU
+#define UCT_IB_MLX5_WORKER_DM_KEY        0xacdf1245u
+#define UCT_IB_MLX5_EXTENDED_UD_AV       0x80 /* htonl(0x80000000) */
+#define UCT_IB_MLX5_AV_GRH_PRESENT       0x40 /* htonl(UCS_BIT(30)) */
+#define UCT_IB_MLX5_BF_REG_SIZE          256
+#define UCT_IB_MLX5_CQE_VENDOR_SYND_ODP  0x93
+#define UCT_IB_MLX5_CQE_VENDOR_SYND_PSN  0x99
+#define UCT_IB_MLX5_CQE_OP_OWN_ERR_MASK  0x80
+#define UCT_IB_MLX5_MAX_SEND_WQE_SIZE    (UCT_IB_MLX5_MAX_BB * MLX5_SEND_WQE_BB)
+#define UCT_IB_MLX5_CQ_SET_CI            0
+#define UCT_IB_MLX5_CQ_ARM_DB            1
+#define UCT_IB_MLX5_LOG_MAX_MSG_SIZE     30
+#define UCT_IB_MLX5_ATOMIC_MODE          3
+#define UCT_IB_MLX5_CQE_FLAG_L3_IN_DATA  UCS_BIT(28) /* GRH/IP in the receive buffer */
+#define UCT_IB_MLX5_CQE_FLAG_L3_IN_CQE   UCS_BIT(29) /* GRH/IP in the CQE */
+#define UCT_IB_MLX5_MP_RQ_BYTE_CNT_MASK  0x0000FFFF  /* Byte count mask for multi-packet RQs */
+#define UCT_IB_MLX5_MP_RQ_FIRST_MSG_FLAG UCS_BIT(29) /* MP first packet indication */
+#define UCT_IB_MLX5_MP_RQ_LAST_MSG_FLAG  UCS_BIT(30) /* MP last packet indication */
+#define UCT_IB_MLX5_MP_RQ_FILLER_FLAG    UCS_BIT(31) /* Filler CQE indicator */
 
+#if HAVE_DECL_MLX5DV_UAR_ALLOC_TYPE_BF
+#  define UCT_IB_MLX5_UAR_ALLOC_TYPE_WC MLX5DV_UAR_ALLOC_TYPE_BF
+#else
+#  define UCT_IB_MLX5_UAR_ALLOC_TYPE_WC 0
+#endif
+
+#if HAVE_DECL_MLX5DV_UAR_ALLOC_TYPE_NC
+#  define UCT_IB_MLX5_UAR_ALLOC_TYPE_NC MLX5DV_UAR_ALLOC_TYPE_NC
+#endif
 
 #define UCT_IB_MLX5_OPMOD_EXT_ATOMIC(_log_arg_size) \
     ((8) | ((_log_arg_size) - 2))
@@ -161,13 +171,22 @@ enum {
     UCT_IB_MLX5_MD_FLAG_INDIRECT_ATOMICS = UCS_BIT(4),
     /* Device supports RMP to create SRQ for AM */
     UCT_IB_MLX5_MD_FLAG_RMP              = UCS_BIT(5),
+    /* Device supports querying bitmask of OOO (AR) states per SL */
+    UCT_IB_MLX5_MD_FLAG_OOO_SL_MASK      = UCS_BIT(6),
+    /* Device has LAG */
+    UCT_IB_MLX5_MD_FLAG_LAG              = UCS_BIT(7),
+    /* Device supports CQE V1 */
+    UCT_IB_MLX5_MD_FLAG_CQE_V1           = UCS_BIT(8),
+    /* Device supports first fragment indication for MP XRQ */
+    UCT_IB_MLX5_MD_FLAG_MP_XRQ_FIRST_MSG = UCS_BIT(9),
 
     /* Object to be created by DevX */
-    UCT_IB_MLX5_MD_FLAG_DEVX_OBJS_SHIFT  = 6,
+    UCT_IB_MLX5_MD_FLAG_DEVX_OBJS_SHIFT  = 10,
     UCT_IB_MLX5_MD_FLAG_DEVX_RC_QP       = UCT_IB_MLX5_MD_FLAG_DEVX_OBJS(RCQP),
     UCT_IB_MLX5_MD_FLAG_DEVX_RC_SRQ      = UCT_IB_MLX5_MD_FLAG_DEVX_OBJS(RCSRQ),
     UCT_IB_MLX5_MD_FLAG_DEVX_DCT         = UCT_IB_MLX5_MD_FLAG_DEVX_OBJS(DCT),
     UCT_IB_MLX5_MD_FLAG_DEVX_DC_SRQ      = UCT_IB_MLX5_MD_FLAG_DEVX_OBJS(DCSRQ),
+    UCT_IB_MLX5_MD_FLAG_DEVX_DCI         = UCT_IB_MLX5_MD_FLAG_DEVX_OBJS(DCI),
 };
 
 
@@ -225,6 +244,7 @@ typedef struct uct_ib_mlx5_iface_config {
     } dm;
 #endif
     uct_ib_mlx5_mmio_mode_t  mmio_mode;
+    ucs_ternary_auto_value_t ar_enable;
 } uct_ib_mlx5_iface_config_t;
 
 
@@ -256,7 +276,6 @@ typedef struct uct_ib_mlx5_srq {
     uint16_t                           ready_idx;  /* what is ready to be posted to hw */
     uint16_t                           sw_pi;      /* what is posted to hw */
     uint16_t                           mask;
-    uint16_t                           tail;       /* tail in the driver */
     uint16_t                           stride;
     union {
         struct {
@@ -321,6 +340,8 @@ typedef struct uct_ib_mlx5_res_domain {
 typedef struct uct_ib_mlx5_qp_attr {
     uct_ib_qp_attr_t            super;
     uct_ib_mlx5_mmio_mode_t     mmio_mode;
+    uint32_t                    uidx;
+    int                         full_handshake;
 } uct_ib_mlx5_qp_attr_t;
 
 
@@ -528,6 +549,11 @@ void uct_ib_mlx5_qp_mmio_cleanup(uct_ib_mlx5_qp_t *qp,
 void uct_ib_mlx5_txwq_reset(uct_ib_mlx5_txwq_t *txwq);
 
 /**
+ * Add txwq attributes to a VFS object
+ */
+void uct_ib_mlx5_txwq_vfs_populate(uct_ib_mlx5_txwq_t *txwq, void *parent_obj);
+
+/**
  * Initialize rxwq structure.
  */
 ucs_status_t uct_ib_mlx5_get_rxwq(struct ibv_qp *qp, uct_ib_mlx5_rxwq_t *wq);
@@ -576,6 +602,14 @@ ucs_status_t uct_ib_mlx5_devx_modify_qp_state(uct_ib_mlx5_qp_t *qp,
                                               enum ibv_qp_state state);
 
 void uct_ib_mlx5_devx_destroy_qp(uct_ib_mlx5_md_t *md, uct_ib_mlx5_qp_t *qp);
+
+ucs_status_t uct_ib_mlx5_devx_query_ooo_sl_mask(uct_ib_mlx5_md_t *md,
+                                                uint8_t port_num,
+                                                uint16_t *ooo_sl_mask_p);
+
+void uct_ib_mlx5_devx_set_qpc_port_affinity(uct_ib_mlx5_md_t *md,
+                                            uint8_t path_index, void *qpc,
+                                            uint32_t *opt_param_mask);
 
 static inline ucs_status_t
 uct_ib_mlx5_md_buf_alloc(uct_ib_mlx5_md_t *md, size_t size, int silent,
@@ -669,6 +703,18 @@ uct_ib_mlx5_devx_modify_qp_state(uct_ib_mlx5_qp_t *qp, enum ibv_qp_state state)
 static inline void uct_ib_mlx5_devx_destroy_qp(uct_ib_mlx5_md_t *md, uct_ib_mlx5_qp_t *qp) { }
 
 #endif
+
+ucs_status_t
+uct_ib_mlx5_select_sl(const uct_ib_iface_config_t *ib_config,
+                      ucs_ternary_auto_value_t ar_enable,
+                      uint16_t hw_sl_mask, int have_sl_mask_cap,
+                      const char *dev_name, uint8_t port_num,
+                      uint8_t *sl_p);
+
+ucs_status_t
+uct_ib_mlx5_iface_select_sl(uct_ib_iface_t *iface,
+                            const uct_ib_mlx5_iface_config_t *ib_mlx5_config,
+                            const uct_ib_iface_config_t *ib_config);
 
 static inline uct_ib_mlx5_dbrec_t *uct_ib_mlx5_get_dbrec(uct_ib_mlx5_md_t *md)
 {

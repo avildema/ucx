@@ -60,6 +60,13 @@
 /* Maximal value for connection sequence number */
 #define UCT_TCP_CM_CONN_SN_MAX               UINT64_MAX
 
+/* The seconds the connection needs to remain idle before TCP starts sending
+ * keepalive probes */
+#define UCT_TCP_EP_DEFAULT_KEEPALIVE_IDLE    10
+
+/* The seconds between individual keepalive probes */
+#define UCT_TCP_EP_DEFAULT_KEEPALIVE_INTVL   1
+
 
 /**
  * TCP EP connection manager ID
@@ -157,11 +164,11 @@ typedef enum uct_tcp_cm_conn_event {
     /* Connection request from a EP that has TX capability to a EP that
      * has to be able to receive AM data (i.e. has to have RX capability). */
     UCT_TCP_CM_CONN_REQ               = UCS_BIT(0),
-    /* Connection acknowledgment from a EP that accepts a conenction from
+    /* Connection acknowledgment from a EP that accepts a connection from
      * initiator of a connection request. */
     UCT_TCP_CM_CONN_ACK               = UCS_BIT(1),
     /* Connection acknowledgment + Connection request. The mesasge is sent
-     * from a EP that accepts remote conenction when it was in
+     * from a EP that accepts remote connection when it was in
      * `UCT_TCP_EP_CONN_STATE_CONNECTING` state (i.e. original
      * `UCT_TCP_CM_CONN_REQ` wasn't sent yet) and want to have RX capability
      * on a peer's EP in order to send AM data. */
@@ -205,11 +212,13 @@ typedef struct uct_tcp_am_hdr {
  */
 typedef enum uct_tcp_ep_am_id {
     /* AM ID reserved for TCP internal Connection Manager messages */
-    UCT_TCP_EP_CM_AM_ID      = UCT_AM_ID_MAX,
+    UCT_TCP_EP_CM_AM_ID        = UCT_AM_ID_MAX,
     /* AM ID reserved for TCP internal PUT REQ message */
-    UCT_TCP_EP_PUT_REQ_AM_ID = UCT_AM_ID_MAX + 1,
+    UCT_TCP_EP_PUT_REQ_AM_ID   = UCT_AM_ID_MAX + 1,
     /* AM ID reserved for TCP internal PUT ACK message */
-    UCT_TCP_EP_PUT_ACK_AM_ID = UCT_AM_ID_MAX + 2
+    UCT_TCP_EP_PUT_ACK_AM_ID   = UCT_AM_ID_MAX + 2,
+    /* AM ID reserved for TCP internal PUT ACK message */
+    UCT_TCP_EP_KEEPALIVE_AM_ID = UCT_AM_ID_MAX + 3
 } uct_tcp_ep_am_id_t;
 
 
@@ -272,12 +281,45 @@ typedef struct uct_tcp_ep_zcopy_tx {
 
 
 /**
+ * TCP device address flags
+ */
+typedef enum uct_tcp_device_addr_flags {
+    /**
+     * Device address is extended by additional information:
+     * @ref uct_iface_local_addr_ns_t for loopback reachability
+     */
+    UCT_TCP_DEVICE_ADDR_FLAG_LOOPBACK = UCS_BIT(0)
+} uct_tcp_device_addr_flags_t;
+
+
+/**
+ * TCP device address
+ */
+typedef struct uct_tcp_device_addr {
+    uint8_t flags; /* Flags of type @ref uct_tcp_device_addr_flags_t */
+    uint8_t sa_family; /* Address family of packed address */
+    /* The following packed fields follow:
+     * 1. in_addr/in6_addr structure in case of non-loopback interface
+     * 2. @ref uct_iface_local_addr_ns_t in case of loopback interface
+     */
+} UCS_S_PACKED uct_tcp_device_addr_t;
+
+
+/**
+ * TCP iface address
+ */
+typedef struct uct_tcp_iface_addr {
+    uint16_t port; /* Listening port of iface */
+} UCS_S_PACKED uct_tcp_iface_addr_t;
+
+
+/**
  * TCP endpoint address
  */
 typedef struct uct_tcp_ep_addr {
-    in_port_t                     iface_addr;     /* Interface address */
-    ucs_ptr_map_key_t             ptr_map_key;    /* PTR map key, used by EPs created with
-                                                   * CONNECT_TO_EP method */
+    uct_tcp_iface_addr_t iface_addr; /* TCP iface address */
+    ucs_ptr_map_key_t    ptr_map_key; /* PTR map key, used by EPs created with
+                                       * CONNECT_TO_EP method */
 } UCS_S_PACKED uct_tcp_ep_addr_t;
 
 
@@ -336,10 +378,10 @@ typedef struct uct_tcp_iface {
         size_t                    rx_seg_size;       /* RX AM buffer size */
         size_t                    sendv_thresh;      /* Minimum size of user's payload from which
                                                       * non-blocking vector send should be used */
-        struct {
-            size_t                max_iov;           /* Maximum supported IOVs limited by
+        size_t                    max_iov;           /* Maximum supported IOVs limited by
                                                       * user configuration and service buffers
                                                       * (TCP protocol and user's AM headers) */
+        struct {
             size_t                max_hdr;           /* Maximum supported AM Zcopy header */
             size_t                hdr_offset;        /* Offset in TX buffer to empty space that
                                                       * can be used for AM Zcopy header */
@@ -356,6 +398,16 @@ typedef struct uct_tcp_iface {
         unsigned                  syn_cnt;           /* Number of SYN retransmits that TCP should send
                                                       * before aborting the attempt to connect.
                                                       * It cannot exceed 255. */
+        struct {
+            ucs_time_t            idle;              /* The time the connection needs to remain
+                                                      * idle before TCP starts sending keepalive
+                                                      * probes (TCP_KEEPIDLE socket option) */
+            unsigned              cnt;               /* The maximum number of keepalive probes TCP
+                                                      * should send before dropping the connection
+                                                      * (TCP_KEEPCNT socket option). */
+            ucs_time_t            intvl;             /* The time between individual keepalive
+                                                      * probes (TCP_KEEPINTVL socket option). */
+        } keepalive;
     } config;
 
     struct {
@@ -386,6 +438,11 @@ typedef struct uct_tcp_iface_config {
     uct_iface_mpool_config_t       tx_mpool;
     uct_iface_mpool_config_t       rx_mpool;
     ucs_range_spec_t               port_range;
+    struct {
+        ucs_time_t                 idle;
+        unsigned                   cnt;
+        ucs_time_t                 intvl;
+    } keepalive;
 } uct_tcp_iface_config_t;
 
 
@@ -428,6 +485,10 @@ ucs_status_t uct_tcp_ep_handle_io_err(uct_tcp_ep_t *ep, const char *op_str,
 ucs_status_t uct_tcp_ep_init(uct_tcp_iface_t *iface, int fd,
                              const struct sockaddr_in *dest_addr,
                              uct_tcp_ep_t **ep_p);
+
+ucs_status_t uct_tcp_ep_set_dest_addr(const uct_device_addr_t *dev_addr,
+                                      const uct_iface_addr_t *iface_addr,
+                                      struct sockaddr *dest_addr);
 
 uint64_t uct_tcp_ep_get_cm_id(const uct_tcp_ep_t *ep);
 
@@ -476,6 +537,9 @@ void uct_tcp_ep_pending_queue_dispatch(uct_tcp_ep_t *ep);
 ucs_status_t uct_tcp_ep_am_short(uct_ep_h uct_ep, uint8_t am_id, uint64_t header,
                                  const void *payload, unsigned length);
 
+ucs_status_t uct_tcp_ep_am_short_iov(uct_ep_h uct_ep, uint8_t am_id,
+                                     const uct_iov_t *iov, size_t iovcnt);
+
 ssize_t uct_tcp_ep_am_bcopy(uct_ep_h uct_ep, uint8_t am_id,
                             uct_pack_callback_t pack_cb, void *arg,
                             unsigned flags);
@@ -497,6 +561,9 @@ void uct_tcp_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
 
 ucs_status_t uct_tcp_ep_flush(uct_ep_h tl_ep, unsigned flags,
                               uct_completion_t *comp);
+
+ucs_status_t
+uct_tcp_ep_check(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
 
 ucs_status_t uct_tcp_cm_send_event(uct_tcp_ep_t *ep,
                                    uct_tcp_cm_conn_event_t event,
@@ -534,6 +601,8 @@ ucs_status_t uct_tcp_cm_handle_incoming_conn(uct_tcp_iface_t *iface,
                                              int fd);
 
 ucs_status_t uct_tcp_cm_conn_start(uct_tcp_ep_t *ep);
+
+int uct_tcp_keepalive_is_enabled(uct_tcp_iface_t *iface);
 
 static inline void uct_tcp_iface_outstanding_inc(uct_tcp_iface_t *iface)
 {

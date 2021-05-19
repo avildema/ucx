@@ -66,7 +66,7 @@ void ucs_close_fd(int *fd_p)
 
 int ucs_netif_flags_is_active(unsigned int flags)
 {
-    return (flags & IFF_UP) && (flags & IFF_RUNNING) && !(flags & IFF_LOOPBACK);
+    return (flags & IFF_UP) && (flags & IFF_RUNNING);
 }
 
 ucs_status_t ucs_netif_ioctl(const char *if_name, unsigned long request,
@@ -365,7 +365,7 @@ ucs_status_t ucs_socket_set_buffer_size(int fd, size_t sockopt_sndbuf,
 
 ucs_status_t ucs_socket_server_init(const struct sockaddr *saddr, socklen_t socklen,
                                     int backlog, int silent_err_in_use,
-                                    int allow_addr_inuse, int *listen_fd)
+                                    int reuse_addr, int *listen_fd)
 {
     int so_reuse_optval = 1;
     char ip_port_str[UCS_SOCKADDR_STRING_LEN];
@@ -374,6 +374,7 @@ ucs_status_t ucs_socket_server_init(const struct sockaddr *saddr, socklen_t sock
     int ret, fd;
 
     /* Create the server socket for accepting incoming connections */
+    fd     = -1; /* Suppress compiler warning */
     status = ucs_socket_create(saddr->sa_family, SOCK_STREAM, &fd);
     if (status != UCS_OK) {
         goto err;
@@ -385,7 +386,7 @@ ucs_status_t ucs_socket_server_init(const struct sockaddr *saddr, socklen_t sock
         goto err_close_socket;
     }
 
-    if (allow_addr_inuse) {
+    if (reuse_addr) {
         status = ucs_socket_setopt(fd, SOL_SOCKET, SO_REUSEADDR,
                                    &so_reuse_optval, sizeof(so_reuse_optval));
         if (status != UCS_OK) {
@@ -637,6 +638,38 @@ const void *ucs_sockaddr_get_inet_addr(const struct sockaddr *addr)
     }
 }
 
+ucs_status_t ucs_sockaddr_set_inet_addr(struct sockaddr *addr,
+                                        const void *in_addr)
+{
+    switch (addr->sa_family) {
+    case AF_INET:
+        memcpy(&UCS_SOCKET_INET_ADDR(addr), in_addr, UCS_IPV4_ADDR_LEN);
+        return UCS_OK;
+    case AF_INET6:
+        memcpy(&UCS_SOCKET_INET6_ADDR(addr), in_addr, UCS_IPV6_ADDR_LEN);
+        return UCS_OK;
+    default:
+        ucs_error("unknown address family: %d", addr->sa_family);
+        return UCS_ERR_INVALID_PARAM;
+    }
+}
+
+ucs_status_t ucs_sockaddr_inet_addr_sizeof(const struct sockaddr *addr,
+                                           size_t *size_p)
+{
+    switch (addr->sa_family) {
+    case AF_INET:
+        *size_p = UCS_IPV4_ADDR_LEN;
+        return UCS_OK;
+    case AF_INET6:
+        *size_p = UCS_IPV6_ADDR_LEN;
+        return UCS_OK;
+    default:
+        ucs_error("unknown address family: %d", addr->sa_family);
+        return UCS_ERR_INVALID_PARAM;
+    }
+}
+
 int ucs_sockaddr_is_known_af(const struct sockaddr *sa)
 {
     return ((sa->sa_family == AF_INET) ||
@@ -649,14 +682,19 @@ const char* ucs_sockaddr_str(const struct sockaddr *sock_addr,
     uint16_t port;
     size_t str_len;
 
+    if (sock_addr == NULL) {
+        ucs_strncpy_zero(str, "<null>", max_size);
+        return str;
+    }
+
     if (!ucs_sockaddr_is_known_af(sock_addr)) {
         ucs_strncpy_zero(str, "<invalid address family>", max_size);
         return str;
     }
 
-    if (!inet_ntop(sock_addr->sa_family, ucs_sockaddr_get_inet_addr(sock_addr),
-                   str, max_size)) {
-        ucs_strncpy_zero(str, "<failed to convert sockaddr to string>", max_size);
+    if (ucs_sockaddr_get_ipstr(sock_addr, str, max_size) != UCS_OK) {
+        ucs_strncpy_zero(str, "<failed to convert sockaddr to string>",
+                         max_size);
         return str;
     }
 
@@ -670,6 +708,33 @@ const char* ucs_sockaddr_str(const struct sockaddr *sock_addr,
     ucs_snprintf_zero(str + str_len, max_size - str_len, ":%d", port);
 
     return str;
+}
+
+ucs_status_t ucs_sock_ipstr_to_sockaddr(const char *ip_str,
+                                        struct sockaddr_storage *sa_storage)
+{
+    struct sockaddr_in* sa_in;
+    struct sockaddr_in6* sa_in6;
+    int ret;
+
+    /* try IPv4 */
+    sa_in             = (struct sockaddr_in*)sa_storage;
+    sa_in->sin_family = AF_INET;
+    ret = inet_pton(AF_INET, ip_str, &sa_in->sin_addr);
+    if (ret == 1) {
+        return UCS_OK;
+    }
+
+    /* try IPv6 */
+    sa_in6              = (struct sockaddr_in6*)sa_storage;
+    sa_in6->sin6_family = AF_INET6;
+    ret = inet_pton(AF_INET6, ip_str, &sa_in6->sin6_addr);
+    if (ret == 1) {
+        return UCS_OK;
+    }
+
+    ucs_error("invalid address %s", ip_str);
+    return UCS_ERR_INVALID_ADDR;
 }
 
 int ucs_sockaddr_cmp(const struct sockaddr *sa1,
@@ -736,13 +801,27 @@ int ucs_sockaddr_ip_cmp(const struct sockaddr *sa1, const struct sockaddr *sa2)
                   UCS_IPV4_ADDR_LEN : UCS_IPV6_ADDR_LEN);
 }
 
-int ucs_sockaddr_is_inaddr_any(struct sockaddr *addr)
+int ucs_sockaddr_is_inaddr_any(const struct sockaddr *addr)
 {
     switch (addr->sa_family) {
     case AF_INET:
-        return UCS_SOCKET_INET_ADDR(addr).s_addr == INADDR_ANY;
+        return UCS_SOCKET_INET_ADDR(addr).s_addr == htonl(INADDR_ANY);
     case AF_INET6:
         return !memcmp(&(UCS_SOCKET_INET6_ADDR(addr)), &in6addr_any,
+                       sizeof(UCS_SOCKET_INET6_ADDR(addr)));
+    default:
+        ucs_debug("invalid address family: %d", addr->sa_family);
+        return 0;
+    }
+}
+
+int ucs_sockaddr_is_inaddr_loopback(const struct sockaddr *addr)
+{
+    switch (addr->sa_family) {
+    case AF_INET:
+        return UCS_SOCKET_INET_ADDR(addr).s_addr == htonl(INADDR_LOOPBACK);
+    case AF_INET6:
+        return !memcmp(&(UCS_SOCKET_INET6_ADDR(addr)), &in6addr_loopback,
                        sizeof(UCS_SOCKET_INET6_ADDR(addr)));
     default:
         ucs_debug("invalid address family: %d", addr->sa_family);
@@ -853,6 +932,17 @@ ucs_status_t ucs_sockaddr_get_ip_local_port_range(ucs_range_spec_t *port_range)
     port_range->last = strtol(endptr, &endptr, 10);
     if (port_range->last <= 0) {
         return UCS_ERR_IO_ERROR;
+    }
+
+    return UCS_OK;
+}
+
+ucs_status_t
+ucs_sockaddr_get_ipstr(const struct sockaddr *addr, char *str, size_t max_size)
+{
+    if (inet_ntop(addr->sa_family, ucs_sockaddr_get_inet_addr(addr), str,
+                  max_size) == NULL) {
+        return UCS_ERR_INVALID_PARAM;
     }
 
     return UCS_OK;

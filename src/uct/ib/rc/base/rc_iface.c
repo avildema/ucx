@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -15,6 +15,7 @@
 #include <ucs/debug/memtrack.h>
 #include <ucs/debug/log.h>
 #include <ucs/type/class.h>
+#include <ucs/vfs/base/vfs_obj.h>
 
 
 static const char *uct_rc_fence_mode_values[] = {
@@ -90,6 +91,11 @@ ucs_config_field_t uct_rc_iface_common_config_table[] = {
    "Maximal number of bytes simultaneously transferred by get/RDMA_READ operations.",
    ucs_offsetof(uct_rc_iface_common_config_t, tx.max_get_bytes), UCS_CONFIG_TYPE_MEMUNITS},
 
+  {"TX_POLL_ALWAYS", "n",
+   "When enabled, TX completions are polled every time the progress function is invoked.\n"
+   "Otherwise poll TX completions only if no RX completions found.",
+   ucs_offsetof(uct_rc_iface_common_config_t, tx.poll_always), UCS_CONFIG_TYPE_BOOL},
+
   {NULL}
 };
 
@@ -139,21 +145,10 @@ static ucs_mpool_ops_t uct_rc_pending_mpool_ops = {
     .obj_cleanup   = NULL
 };
 
-static void
-uct_rc_iface_flush_comp_init(ucs_mpool_t *mp, void *obj, void *chunk)
-{
-    uct_rc_iface_t *iface      = ucs_container_of(mp, uct_rc_iface_t, tx.send_op_mp);
-    uct_rc_iface_send_op_t *op = obj;
-
-    op->handler = uct_rc_ep_flush_op_completion_handler;
-    op->flags   = 0;
-    op->iface   = iface;
-}
-
 static ucs_mpool_ops_t uct_rc_send_op_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
-    .obj_init      = uct_rc_iface_flush_comp_init,
+    .obj_init      = NULL,
     .obj_cleanup   = NULL
 };
 
@@ -354,8 +349,8 @@ ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
 
     ucs_assert(iface->config.fc_enabled);
 
-    if (ep == NULL) {
-        /* We get fc for ep which is being removed so should ignore it */
+    if ((ep == NULL) || (ep->flags & UCT_RC_EP_FLAG_FLUSH_CANCEL)) {
+        /* We get fc for ep which is being removed or canceled so should ignore it */
         goto out;
     }
 
@@ -409,8 +404,7 @@ ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
         if (status == UCS_ERR_NO_RESOURCE){
             /* force add request to group & schedule group to eliminate
              * FC deadlock */
-            uct_pending_req_arb_group_push_head(&iface->tx.arbiter,
-                                                &ep->arb_group, &fc_req->super);
+            uct_pending_req_arb_group_push_head(&ep->arb_group, &fc_req->super);
             ucs_arbiter_group_schedule(&iface->tx.arbiter, &ep->arb_group);
         } else {
             ucs_assertv_always(status == UCS_OK, "Failed to send FC grant msg: %s",
@@ -450,7 +444,7 @@ static ucs_status_t uct_rc_iface_tx_ops_init(uct_rc_iface_t *iface)
     status = ucs_mpool_init(&iface->tx.send_op_mp, 0, sizeof(*op), 0,
                             UCS_SYS_CACHE_LINE_SIZE, 256,
                             UINT_MAX, &uct_rc_send_op_mpool_ops,
-                            "flush-comps-only");
+                            "send-ops-mpool");
 
     return status;
 }
@@ -516,42 +510,47 @@ static int uct_rc_iface_config_limit_value(const char *name,
      }
 }
 
-UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
-                    uct_worker_h worker, const uct_iface_params_t *params,
+UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops,
+                    uct_iface_ops_t *tl_ops, uct_md_h md, uct_worker_h worker,
+                    const uct_iface_params_t *params,
                     const uct_rc_iface_common_config_t *config,
-                    uct_ib_iface_init_attr_t *init_attr)
+                    const uct_ib_iface_init_attr_t *init_attr)
 {
     uct_ib_device_t *dev = &ucs_derived_of(md, uct_ib_md_t)->dev;
     uint32_t max_ib_msg_size;
     ucs_status_t status;
+    unsigned tx_cq_size;
 
-    UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &ops->super, md, worker, params,
-                              &config->super, init_attr);
+    UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &ops->super, tl_ops, md, worker,
+                              params, &config->super, init_attr);
 
-    self->tx.cq_available           = init_attr->cq_len[UCT_IB_DIR_TX] - 1;
-    self->rx.srq.available          = 0;
-    self->rx.srq.quota              = 0;
-    self->config.tx_qp_len          = config->super.tx.queue_len;
-    self->config.tx_min_sge         = config->super.tx.min_sge;
-    self->config.tx_min_inline      = config->super.tx.min_inline;
-    self->config.tx_ops_count       = init_attr->cq_len[UCT_IB_DIR_TX];
-    self->config.min_rnr_timer      = uct_ib_to_rnr_fabric_time(config->tx.rnr_timeout);
-    self->config.timeout            = uct_ib_to_qp_fabric_time(config->tx.timeout);
-    self->config.rnr_retry          = uct_rc_iface_config_limit_value(
-                                                  "RNR_RETRY_COUNT",
-                                                  config->tx.rnr_retry_count,
-                                                  UCT_RC_QP_MAX_RETRY_COUNT);
-    self->config.retry_cnt          = uct_rc_iface_config_limit_value(
-                                                  "RETRY_COUNT",
-                                                  config->tx.retry_count,
-                                                  UCT_RC_QP_MAX_RETRY_COUNT);
-    self->config.max_rd_atomic      = config->max_rd_atomic;
-    self->config.ooo_rw             = config->ooo_rw;
+    tx_cq_size                  = uct_ib_cq_size(&self->super, init_attr,
+                                                 UCT_IB_DIR_TX);
+    self->tx.cq_available       = tx_cq_size - 1;
+    self->rx.srq.available      = 0;
+    self->rx.srq.quota          = 0;
+    self->config.tx_qp_len      = config->super.tx.queue_len;
+    self->config.tx_min_sge     = config->super.tx.min_sge;
+    self->config.tx_min_inline  = config->super.tx.min_inline;
+    self->config.tx_poll_always = config->tx.poll_always;
+    self->config.tx_ops_count   = tx_cq_size;
+    self->config.min_rnr_timer  = uct_ib_to_rnr_fabric_time(config->tx.rnr_timeout);
+    self->config.timeout        = uct_ib_to_qp_fabric_time(config->tx.timeout);
+    self->config.rnr_retry      = uct_rc_iface_config_limit_value(
+                                                     "RNR_RETRY_COUNT",
+                                                     config->tx.rnr_retry_count,
+                                                     UCT_RC_QP_MAX_RETRY_COUNT);
+    self->config.retry_cnt      = uct_rc_iface_config_limit_value(
+                                                     "RETRY_COUNT",
+                                                     config->tx.retry_count,
+                                                     UCT_RC_QP_MAX_RETRY_COUNT);
+    self->config.max_rd_atomic  = config->max_rd_atomic;
+    self->config.ooo_rw         = config->ooo_rw;
 #if UCS_ENABLE_ASSERT
-    self->config.tx_cq_len          = init_attr->cq_len[UCT_IB_DIR_TX];
-    self->tx.in_pending             = 0;
+    self->config.tx_cq_len      = tx_cq_size;
+    self->tx.in_pending         = 0;
 #endif
-    max_ib_msg_size                 = uct_ib_iface_port_attr(&self->super)->max_msg_sz;
+    max_ib_msg_size             = uct_ib_iface_port_attr(&self->super)->max_msg_sz;
 
     if (config->tx.max_get_zcopy == UCS_MEMUNITS_AUTO) {
         self->config.max_get_zcopy = max_ib_msg_size;
@@ -588,7 +587,7 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
     }
 
     /* Create RX buffers mempool */
-    status = uct_ib_iface_recv_mpool_init(&self->super, &config->super,
+    status = uct_ib_iface_recv_mpool_init(&self->super, &config->super, params,
                                           "rc_recv_desc", &self->rx.mp);
     if (status != UCS_OK) {
         goto err;
@@ -652,13 +651,13 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
          * Then FC window size is the same for all endpoints as well.
          * TODO: Make wnd size to be a property of the particular interface.
          * We could distribute it via rc address then.*/
-        self->config.fc_wnd_size     = ucs_min(config->fc.wnd_size,
-                                               config->super.rx.queue_len);
-        self->config.fc_hard_thresh  = ucs_max((int)(self->config.fc_wnd_size *
-                                               config->fc.hard_thresh), 1);
+        self->config.fc_wnd_size    = ucs_min(config->fc.wnd_size,
+                                              config->super.rx.queue_len);
+        self->config.fc_hard_thresh = ucs_max((int)(self->config.fc_wnd_size *
+                                              config->fc.hard_thresh), 1);
     } else {
-        self->config.fc_wnd_size     = INT16_MAX;
-        self->config.fc_hard_thresh  = 0;
+        self->config.fc_wnd_size    = INT16_MAX;
+        self->config.fc_hard_thresh = 0;
     }
 
     return UCS_OK;
@@ -907,4 +906,17 @@ ucs_status_t uct_rc_iface_fence(uct_iface_h tl_iface, unsigned flags)
 
     UCT_TL_IFACE_STAT_FENCE(&iface->super.super);
     return UCS_OK;
+}
+
+void uct_rc_iface_vfs_populate(uct_rc_iface_t *iface)
+{
+    ucs_vfs_obj_add_ro_file(iface, ucs_vfs_show_primitive,
+                            &iface->tx.cq_available, UCS_VFS_TYPE_INT,
+                            "cq_available");
+    ucs_vfs_obj_add_ro_file(iface, ucs_vfs_show_primitive,
+                            &iface->tx.reads_available, UCS_VFS_TYPE_SSIZET,
+                            "reads_available");
+    ucs_vfs_obj_add_ro_file(iface, ucs_vfs_show_primitive,
+                            &iface->tx.reads_completed, UCS_VFS_TYPE_SSIZET,
+                            "reads_completed");
 }

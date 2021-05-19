@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -16,6 +16,8 @@
 #include <ucs/sys/string.h>
 #include <ucs/sys/math.h>
 #include <ucs/datastruct/mpool.inl>
+#include <ucs/datastruct/string_buffer.h>
+
 
 #define UCT_IB_MAX_IOV                     8UL
 #define UCT_IB_IFACE_NULL_RES_DOMAIN_KEY   0u
@@ -24,6 +26,7 @@
 #define UCT_IB_ADDRESS_INVALID_PATH_MTU    ((enum ibv_mtu)0)
 #define UCT_IB_ADDRESS_INVALID_PKEY        0
 #define UCT_IB_ADDRESS_DEFAULT_PKEY        0xffff
+#define UCT_IB_SL_NUM                      16
 
 /* Forward declarations */
 typedef struct uct_ib_iface_config   uct_ib_iface_config_t;
@@ -59,6 +62,8 @@ enum {
     UCT_IB_QPT_DCI = IBV_EXP_QPT_DC_INI,
 #elif HAVE_DC_DV
     UCT_IB_QPT_DCI = IBV_QPT_DRIVER,
+#else
+    UCT_IB_QPT_DCI = UCT_IB_QPT_UNKNOWN,
 #endif
 };
 
@@ -136,8 +141,8 @@ struct uct_ib_iface_config {
     /* Force global routing */
     int                     is_global;
 
-    /* IB SL to use */
-    unsigned                sl;
+    /* IB SL to use (default: AUTO) */
+    unsigned long           sl;
 
     /* IB Traffic Class to use */
     unsigned long           traffic_class;
@@ -167,7 +172,12 @@ struct uct_ib_iface_config {
 
 enum {
     UCT_IB_CQ_IGNORE_OVERRUN         = UCS_BIT(0),
-    UCT_IB_TM_SUPPORTED              = UCS_BIT(1)
+    UCT_IB_TM_SUPPORTED              = UCS_BIT(1),
+
+    /* Indicates that TX cq len in uct_ib_iface_init_attr_t is specified per
+     * each IB path. Therefore IB interface constructor would need to multiply
+     * TX CQ len by the number of IB paths (when it is properly initialized). */
+    UCT_IB_TX_OPS_PER_PATH           = UCS_BIT(2)
 };
 
 
@@ -221,12 +231,11 @@ typedef ucs_status_t (*uct_ib_iface_set_ep_failed_func_t)(uct_ib_iface_t *iface,
 
 
 struct uct_ib_iface_ops {
-    uct_iface_ops_t                    super;
+    uct_iface_internal_ops_t           super;
     uct_ib_iface_create_cq_func_t      create_cq;
     uct_ib_iface_arm_cq_func_t         arm_cq;
     uct_ib_iface_event_cq_func_t       event_cq;
     uct_ib_iface_handle_failure_func_t handle_failure;
-    uct_ib_iface_set_ep_failed_func_t  set_ep_failed;
 };
 
 
@@ -276,8 +285,9 @@ typedef struct uct_ib_fence_info {
 } uct_ib_fence_info_t;
 
 
-UCS_CLASS_DECLARE(uct_ib_iface_t, uct_ib_iface_ops_t*, uct_md_h, uct_worker_h,
-                  const uct_iface_params_t*, const uct_ib_iface_config_t*,
+UCS_CLASS_DECLARE(uct_ib_iface_t, uct_ib_iface_ops_t*, uct_iface_ops_t*,
+                  uct_md_h, uct_worker_h, const uct_iface_params_t*,
+                  const uct_ib_iface_config_t*,
                   const uct_ib_iface_init_attr_t*);
 
 /*
@@ -334,6 +344,7 @@ extern const char *uct_ib_mtu_values[];
  */
 ucs_status_t uct_ib_iface_recv_mpool_init(uct_ib_iface_t *iface,
                                           const uct_ib_iface_config_t *config,
+                                          const uct_iface_params_t *params,
                                           const char *name, ucs_mpool_t *mp);
 
 void uct_ib_iface_release_desc(uct_recv_desc_t *self, void *desc);
@@ -529,6 +540,8 @@ ucs_status_t uct_ib_iface_create_qp(uct_ib_iface_t *iface,
 void uct_ib_iface_fill_attr(uct_ib_iface_t *iface,
                             uct_ib_qp_attr_t *attr);
 
+uint8_t uct_ib_iface_config_select_sl(const uct_ib_iface_config_t *ib_config);
+
 
 #define UCT_IB_IFACE_FMT \
     "%s:%d"
@@ -575,7 +588,7 @@ size_t uct_ib_verbs_sge_fill_iov(struct ibv_sge *sge, const uct_iov_t *iov,
             continue; /* to avoid zero length elements in sge */
         }
 
-        if (iov[sge_it].memh == UCT_MEM_HANDLE_NULL) {
+        if (iov[iov_it].memh == UCT_MEM_HANDLE_NULL) {
             sge[sge_it].lkey = 0;
         } else {
             sge[sge_it].lkey = uct_ib_memh_get_lkey(iov[iov_it].memh);
@@ -598,18 +611,16 @@ uct_ib_fence_info_init(uct_ib_fence_info_t* fence)
     fence->fence_beat = 0;
 }
 
-static UCS_F_ALWAYS_INLINE
-ucs_log_level_t uct_ib_iface_failure_log_level(uct_ib_iface_t *ib_iface,
-                                               ucs_status_t err_handler_status,
-                                               ucs_status_t status)
+static UCS_F_ALWAYS_INLINE unsigned
+uct_ib_cq_size(uct_ib_iface_t *iface, const uct_ib_iface_init_attr_t *init_attr,
+               uct_ib_dir_t dir)
 {
-    if (err_handler_status != UCS_OK) {
-        return UCS_LOG_LEVEL_FATAL;
-    } else if ((status == UCS_ERR_ENDPOINT_TIMEOUT) ||
-               (status == UCS_ERR_CONNECTION_RESET)) {
-        return ib_iface->super.config.failure_level;
+    if (dir == UCT_IB_DIR_RX) {
+        return init_attr->cq_len[UCT_IB_DIR_RX];
+    } else if (init_attr->flags & UCT_IB_TX_OPS_PER_PATH) {
+        return init_attr->cq_len[UCT_IB_DIR_TX] * iface->num_paths;
     } else {
-        return UCS_LOG_LEVEL_ERROR;
+        return init_attr->cq_len[UCT_IB_DIR_TX];
     }
 }
 
