@@ -1,6 +1,17 @@
 version: "3"
 
 services:
+  rh7.0-mofed5.0-cuda11.2:
+    image: rh7.0-mofed5.0-cuda11.2
+    build:
+      context: .
+      network: host
+      dockerfile: RH70.Dockerfile
+      args:
+        MOFED_VERSION: 5.0-1.0.0.0
+        MOFED_OS: rhel7.2
+        CUDA_VERSION: 11.2
+        OS_VERSION: 7
   centos7-mofed5.1-cuda11.1:
     image: centos7-mofed5.1-cuda11.1
     build:
