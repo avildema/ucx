@@ -6,7 +6,8 @@ ARG MOFED_OS
 ENV MOFED_DIR MLNX_OFED_LINUX-${MOFED_VERSION}-${MOFED_OS}-x86_64
 ENV MOFED_SITE_PLACE MLNX_OFED-${MOFED_VERSION}
 ENV MOFED_IMAGE ${MOFED_DIR}.tgz
-RUN wget --no-verbose http://content.mellanox.com/ofed/${MOFED_SITE_PLACE}/${MOFED_IMAGE} && \
+RUN yum -y install wget  && yum clean all && \
+    wget --no-verbose http://content.mellanox.com/ofed/${MOFED_SITE_PLACE}/${MOFED_IMAGE} && \
     tar -xzf ${MOFED_IMAGE} && \
     ${MOFED_DIR}/mlnxofedinstall --all -q \
         --user-space-only \
