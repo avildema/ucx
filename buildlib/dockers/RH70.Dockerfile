@@ -17,6 +17,7 @@ RUN yum -y install wget  && yum clean all && \
         --without-hcoll \
         --without-openmpi \
         --without-sharp \
+        --force \
     && rm -rf ${MOFED_DIR} && rm -rf *.tgz
 
 RUN wget https://developer.download.nvidia.com/compute/cuda/11.4.0/local_installers/cuda-repo-rhel7-11-4-local-11.4.0_470.42.01-1.x86_64.rpm && \
